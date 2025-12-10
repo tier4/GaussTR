@@ -51,9 +51,11 @@ print(f"[RANK {_local_rank}] CUDA_HOME={os.environ.get('CUDA_HOME', 'NOT SET')},
 del _glob, _setup_cuda, _local_rank
 # === End CUDA Setup ===
 
-# Set MLflow tracking URI via environment variable BEFORE any imports
+# Set MLflow tracking URI and artifact root via environment variables BEFORE any imports
 # This ensures all DDP worker processes use the database instead of creating mlruns/
-os.environ.setdefault('MLFLOW_TRACKING_URI', 'sqlite:////mnt/nvme0/gausstr_lightning/mlflow.db')
+# Use direct assignment (not setdefault) to override any existing value
+os.environ['MLFLOW_TRACKING_URI'] = 'sqlite:////mnt/nvme0/gausstr_lightning/mlflow.db'
+os.environ['MLFLOW_ARTIFACT_ROOT'] = '/mnt/nvme0/gausstr_lightning/work_dirs/mlflow_artifacts'
 
 import sys
 import warnings
@@ -72,6 +74,9 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger, MLFlowLogger
 import mlflow
+
+# Explicitly set tracking URI right after import to prevent mlruns/ folder creation
+mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
 
 # Suppress MLflow filesystem deprecation warning
 warnings.filterwarnings("ignore", message=".*filesystem tracking backend.*will be deprecated.*")
@@ -94,12 +99,23 @@ from evaluation import OccupancyIoU
 
 
 class MLflowArtifactCallback(Callback):
-    """Callback to log artifacts to MLflow after the run is started."""
+    """Callback to log artifacts to MLflow after the run is started.
+
+    Uses MlflowClient with explicit tracking URI to avoid creating mlruns/ folder.
+    """
 
     def __init__(self, config: DictConfig, checkpoint_dir: str):
         self.config = config
         self.checkpoint_dir = checkpoint_dir
         self._logged = False
+        self._client = None
+
+    def _get_client(self, trainer):
+        """Get MlflowClient using the logger's tracking URI."""
+        if self._client is None:
+            tracking_uri = os.environ.get('MLFLOW_TRACKING_URI')
+            self._client = mlflow.MlflowClient(tracking_uri=tracking_uri)
+        return self._client
 
     def on_train_start(self, trainer, pl_module):
         """Log artifacts once MLflow run is active."""
@@ -109,30 +125,36 @@ class MLflowArtifactCallback(Callback):
 
         # Get the MLflow run_id from the logger
         if hasattr(trainer.logger, 'run_id') and trainer.logger.run_id:
+            run_id = trainer.logger.run_id
+            client = self._get_client(trainer)
+
             # Save and log config
             config_path = os.path.join(self.checkpoint_dir, 'config.yaml')
             with open(config_path, 'w') as f:
                 f.write(OmegaConf.to_yaml(self.config))
-            mlflow.log_artifact(config_path)
-            print(f"Logged config artifact to MLflow run {trainer.logger.run_id}")
+            client.log_artifact(run_id, config_path)
+            print(f"Logged config artifact to MLflow run {run_id}")
 
     def on_train_end(self, trainer, pl_module):
         """Log final checkpoints and outputs to MLflow."""
         if not hasattr(trainer.logger, 'run_id') or not trainer.logger.run_id:
             return
 
+        run_id = trainer.logger.run_id
+        client = self._get_client(trainer)
+
         # Log best checkpoint
         if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
             best_ckpt = trainer.checkpoint_callback.best_model_path
             if os.path.exists(best_ckpt):
-                mlflow.log_artifact(best_ckpt, artifact_path="checkpoints")
+                client.log_artifact(run_id, best_ckpt, artifact_path="checkpoints")
                 print(f"Logged best checkpoint to MLflow: {best_ckpt}")
 
         # Log last checkpoint
         if trainer.checkpoint_callback and trainer.checkpoint_callback.last_model_path:
             last_ckpt = trainer.checkpoint_callback.last_model_path
             if os.path.exists(last_ckpt) and last_ckpt != trainer.checkpoint_callback.best_model_path:
-                mlflow.log_artifact(last_ckpt, artifact_path="checkpoints")
+                client.log_artifact(run_id, last_ckpt, artifact_path="checkpoints")
                 print(f"Logged last checkpoint to MLflow: {last_ckpt}")
 
 
@@ -223,6 +245,7 @@ def build_logger(cfg: DictConfig, run_name: str, output_dir: str):
             run_name=run_name,
             tags=cfg.get('mlflow_tags', None),
             artifact_location=artifact_location,
+            save_dir=None,  # Prevent creating ./mlruns folder
         )
     else:  # tensorboard
         return TensorBoardLogger(
