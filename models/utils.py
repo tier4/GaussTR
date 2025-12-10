@@ -172,7 +172,9 @@ def world2cam(
 
 
 def rotmat_to_quat(rot_matrices: torch.Tensor) -> torch.Tensor:
-    """Convert rotation matrices to quaternions.
+    """Convert rotation matrices to quaternions (pure PyTorch GPU implementation).
+
+    Uses Shepperd's method for numerical stability.
 
     Args:
         rot_matrices: Rotation matrices of shape [..., 3, 3].
@@ -180,15 +182,56 @@ def rotmat_to_quat(rot_matrices: torch.Tensor) -> torch.Tensor:
     Returns:
         Quaternions of shape [..., 4] in (w, x, y, z) format.
     """
-    inputs = rot_matrices
-    rot_matrices = rot_matrices.cpu().numpy()
-    quats = []
-    for rot in rot_matrices:
-        while not np.allclose(rot @ rot.T, np.eye(3)):
-            U, _, V = np.linalg.svd(rot)
-            rot = U @ V
-        quats.append(Quaternion(matrix=rot).elements)
-    return torch.from_numpy(np.stack(quats)).to(inputs)
+    batch_shape = rot_matrices.shape[:-2]
+    R = rot_matrices.reshape(-1, 3, 3)
+
+    # Shepperd's method - numerically stable
+    # Compute all four possible quaternion representations
+    trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+
+    # Pre-allocate output
+    quats = torch.zeros(R.shape[0], 4, device=R.device, dtype=R.dtype)
+
+    # Case 1: trace > 0
+    mask1 = trace > 0
+    if mask1.any():
+        s = torch.sqrt(trace[mask1] + 1.0) * 2  # s = 4 * w
+        quats[mask1, 0] = 0.25 * s
+        quats[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) / s
+        quats[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) / s
+        quats[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) / s
+
+    # Case 2: R[0,0] > R[1,1] and R[0,0] > R[2,2]
+    mask2 = (~mask1) & (R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2])
+    if mask2.any():
+        s = torch.sqrt(1.0 + R[mask2, 0, 0] - R[mask2, 1, 1] - R[mask2, 2, 2]) * 2  # s = 4 * x
+        quats[mask2, 0] = (R[mask2, 2, 1] - R[mask2, 1, 2]) / s
+        quats[mask2, 1] = 0.25 * s
+        quats[mask2, 2] = (R[mask2, 0, 1] + R[mask2, 1, 0]) / s
+        quats[mask2, 3] = (R[mask2, 0, 2] + R[mask2, 2, 0]) / s
+
+    # Case 3: R[1,1] > R[2,2]
+    mask3 = (~mask1) & (~mask2) & (R[:, 1, 1] > R[:, 2, 2])
+    if mask3.any():
+        s = torch.sqrt(1.0 + R[mask3, 1, 1] - R[mask3, 0, 0] - R[mask3, 2, 2]) * 2  # s = 4 * y
+        quats[mask3, 0] = (R[mask3, 0, 2] - R[mask3, 2, 0]) / s
+        quats[mask3, 1] = (R[mask3, 0, 1] + R[mask3, 1, 0]) / s
+        quats[mask3, 2] = 0.25 * s
+        quats[mask3, 3] = (R[mask3, 1, 2] + R[mask3, 2, 1]) / s
+
+    # Case 4: else
+    mask4 = (~mask1) & (~mask2) & (~mask3)
+    if mask4.any():
+        s = torch.sqrt(1.0 + R[mask4, 2, 2] - R[mask4, 0, 0] - R[mask4, 1, 1]) * 2  # s = 4 * z
+        quats[mask4, 0] = (R[mask4, 1, 0] - R[mask4, 0, 1]) / s
+        quats[mask4, 1] = (R[mask4, 0, 2] + R[mask4, 2, 0]) / s
+        quats[mask4, 2] = (R[mask4, 1, 2] + R[mask4, 2, 1]) / s
+        quats[mask4, 3] = 0.25 * s
+
+    # Normalize to unit quaternion
+    quats = quats / quats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    return quats.reshape(*batch_shape, 4)
 
 
 def quat_to_rotmat(quats: torch.Tensor) -> torch.Tensor:

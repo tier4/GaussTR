@@ -310,12 +310,13 @@ class GaussTRHead(nn.Module):
         # Training mode: render and compute losses
         tgt_feats = feats.flatten(-2).mT
 
-        # PCA for dimensionality reduction
-        u, s, v = torch.pca_lowrank(
-            tgt_feats.flatten(0, 2).double(), q=self.reduce_dims, niter=4)
-        tgt_feats = tgt_feats @ v.to(tgt_feats)
-        features = features @ v.to(features)
-        features = features.float()
+        # PCA for dimensionality reduction (GPU, FP32)
+        # Disable autocast - pca_lowrank doesn't support FP16
+        with torch.amp.autocast('cuda', enabled=False):
+            u, s, v = torch.pca_lowrank(
+                tgt_feats.flatten(0, 2).float(), q=self.reduce_dims, niter=4)
+        tgt_feats = tgt_feats.float() @ v
+        features = features.float() @ v
 
         # Render Gaussians
         rendered = rasterize_gaussians(
