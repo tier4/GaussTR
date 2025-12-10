@@ -50,7 +50,7 @@ class GaussTRLightning(pl.LightningModule):
         head_depth_limit: float = 51.2,
         head_text_protos: Optional[str] = "ckpts/text_proto_embeds_clip.pth",
         head_prompt_denoising: bool = True,
-        head_num_segment_classes: int = 26,
+        head_num_segment_classes: int = 17,
         # Voxelizer config
         vol_range: List[float] = None,
         voxel_size: float = 0.4,

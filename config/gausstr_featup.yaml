@@ -50,7 +50,7 @@ model:
   head_depth_limit: 51.2
   head_text_protos: "ckpts/text_proto_embeds_clip.pth"
   head_prompt_denoising: true
-  head_num_segment_classes: 26
+  head_num_segment_classes: 17
 
   # Voxelizer config
   vol_range: [-40, -40, -1, 40, 40, 5.4]

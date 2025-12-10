@@ -152,7 +152,7 @@ class GaussTRHead(nn.Module):
         depth_limit: float = 51.2,
         text_protos: Optional[str] = None,
         prompt_denoising: bool = True,
-        num_segment_classes: int = 26,
+        num_segment_classes: int = 17,
         voxelizer_cfg: Optional[Dict[str, Any]] = None
     ):
         super().__init__()
