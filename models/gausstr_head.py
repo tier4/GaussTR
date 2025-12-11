@@ -180,7 +180,7 @@ class GaussTRHead(nn.Module):
         else:
             self.text_proto_embeds = None
 
-        # Voxelizer - pure PyTorch (matches original MMCV GaussianVoxelizer)
+        # Voxelizer - config passed from yaml
         if voxelizer_cfg is None:
             voxelizer_cfg = {
                 'vol_range': [-40, -40, -1, 40, 40, 5.4],

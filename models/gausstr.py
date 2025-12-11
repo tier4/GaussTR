@@ -54,6 +54,8 @@ class GaussTRLightning(pl.LightningModule):
         # Voxelizer config
         vol_range: List[float] = None,
         voxel_size: float = 0.4,
+        filter_gaussians: bool = False,
+        opacity_thresh: float = 0,
         # Training config
         learning_rate: float = 2e-4,
         weight_decay: float = 5e-3,
@@ -141,7 +143,9 @@ class GaussTRLightning(pl.LightningModule):
             'num_segment_classes': head_num_segment_classes,
             'voxelizer_cfg': {
                 'vol_range': vol_range,
-                'voxel_size': voxel_size
+                'voxel_size': voxel_size,
+                'filter_gaussians': filter_gaussians,
+                'opacity_thresh': opacity_thresh
             }
         }
         self.gauss_heads = nn.ModuleList([
