@@ -1,1 +1,0 @@
-"""GaussTR Lightning scripts."""
