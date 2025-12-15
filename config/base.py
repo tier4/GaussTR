@@ -70,6 +70,9 @@ class VoxelizerConfig:
         default_factory=lambda: [-40, -40, -1, 40, 40, 5.4]
     )
     voxel_size: float = 0.4
+    filter_gaussians: bool = False  # Default False to match original GaussTR
+    opacity_thresh: float = 0.0  # Default 0 to match original GaussTR
+    sigma_factor: float = 3.0  # For Gaussian radius calculation (from GaussianFormer)
 
 
 @dataclass

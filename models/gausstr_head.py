@@ -283,7 +283,8 @@ class GaussTRHead(nn.Module):
                 means3d=means3d.flatten(1, 2),
                 opacities=opacities.flatten(1, 2),
                 features=features.flatten(1, 2).softmax(-1),
-                covariances=covariances.flatten(1, 2))
+                scales=scales.flatten(1, 2),
+                rotations=rotations.flatten(1, 2))
 
             if _profile:
                 torch.cuda.synchronize()

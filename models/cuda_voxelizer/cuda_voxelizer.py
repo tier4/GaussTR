@@ -2,9 +2,12 @@
 
 GPU-accelerated voxelization using custom CUDA kernels.
 Multi-GPU DDP compatible with no global state issues.
+
+Uses GaussianFormer-style precision matrix representation (6 elements)
+and optimized Gaussian evaluation formula.
+Reference: https://github.com/huang-yh/GaussianFormer
 """
 
-import os
 import torch
 import torch.nn as nn
 from typing import Tuple, Optional
@@ -57,36 +60,34 @@ def _get_cuda_ext():
 def _filter_gaussians_torch(
     means3d: torch.Tensor,
     opacities: torch.Tensor,
-    covariances: torch.Tensor,
+    cov3D: torch.Tensor,
+    radii: torch.Tensor,
     features: Optional[torch.Tensor],
     vol_range: torch.Tensor,
-    opacity_thresh: float = 1e-4,
-    sigma_factor: float = 3.0
+    opacity_thresh: float = 1e-4
 ) -> Tuple[torch.Tensor, ...]:
     """Pre-filter Gaussians outside volume range (vectorized PyTorch)."""
     vol_min = vol_range[:3]
     vol_max = vol_range[3:]
 
-    # Get sigma bounds for each Gaussian
-    sigma = torch.sqrt(torch.diagonal(covariances, dim1=1, dim2=2))  # [N, 3]
-    bounds_min = means3d - sigma_factor * sigma
-    bounds_max = means3d + sigma_factor * sigma
-
-    # Check if Gaussian bounds overlap with volume
-    mask = ((bounds_max > vol_min).all(dim=1) &
-            (bounds_min < vol_max).all(dim=1))
+    # Check if Gaussian is inside or overlapping volume (using simple mean check)
+    mask = ((means3d >= vol_min).all(dim=1) & (means3d <= vol_max).all(dim=1))
 
     # Also filter low opacity
     opac_flat = opacities.squeeze(-1) if opacities.dim() == 2 else opacities
     mask &= (opac_flat > opacity_thresh)
 
+    # Filter out zero radii
+    mask &= (radii > 0)
+
     if mask.sum() == 0:
-        return None, None, None, None
+        return None, None, None, None, None
 
     return (
         means3d[mask],
         opacities[mask],
-        covariances[mask],
+        cov3D[mask],
+        radii[mask],
         features[mask] if features is not None else None
     )
 
@@ -98,12 +99,15 @@ class CUDAVoxelizer(nn.Module):
     No Python for-loops over Gaussians.
     Multi-GPU DDP compatible (no global state).
 
+    Uses GaussianFormer-style precision matrix format (6 elements):
+    [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
+
     Args:
         vol_range: Volume range [xmin, ymin, zmin, xmax, ymax, zmax].
         voxel_size: Size of each voxel in meters.
         filter_gaussians: Whether to filter Gaussians outside volume.
         opacity_thresh: Minimum opacity threshold for filtering.
-        sigma_factor: Number of sigmas to consider for each Gaussian.
+        sigma_factor: Number of sigmas to consider for each Gaussian (scale multiplier).
         eps: Small value for numerical stability.
     """
 
@@ -111,8 +115,8 @@ class CUDAVoxelizer(nn.Module):
         self,
         vol_range,
         voxel_size,
-        filter_gaussians=True,
-        opacity_thresh=1e-4,
+        filter_gaussians=False,  # Default False to match original GaussTR
+        opacity_thresh=0.0,  # Default 0 to match original GaussTR
         sigma_factor=3.0,
         eps=1e-6
     ):
@@ -131,40 +135,82 @@ class CUDAVoxelizer(nn.Module):
         # Check CUDA availability
         self._cuda_ext = None
 
-    def _get_covariance(
+    def _prepare_gaussian_args(
         self,
         scales: torch.Tensor,
         rotations: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute covariance matrices from scales and rotations."""
-        # Convert quaternions to rotation matrices
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute precision matrix and radii from scales and rotations.
+
+        This follows GaussianFormer's implementation:
+        1. Compute covariance: Cov = R @ S @ S^T @ R^T = (S @ R)^T @ (S @ R)
+        2. Invert to get precision matrix: CovInv = Cov^(-1)
+        3. Pack as 6 elements: [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
+        4. Compute radii from scales
+
+        Args:
+            scales: [N, 3] Gaussian scales
+            rotations: [N, 4] Gaussian rotations (quaternions)
+
+        Returns:
+            cov3D: [N, 6] Packed precision matrix
+            radii: [N] Voxel radii for each Gaussian
+        """
+        n_gaussians = scales.size(0)
+        device = scales.device
+        dtype = scales.dtype
+
+        # Normalize quaternions
         q = rotations / torch.sqrt((rotations**2).sum(dim=-1, keepdim=True) + 1e-8)
         r, x, y, z = q.unbind(-1)
 
-        R = torch.zeros((*r.shape, 3, 3), device=rotations.device, dtype=rotations.dtype)
-        R[..., 0, 0] = 1 - 2 * (y * y + z * z)
-        R[..., 0, 1] = 2 * (x * y - r * z)
-        R[..., 0, 2] = 2 * (x * z + r * y)
-        R[..., 1, 0] = 2 * (x * y + r * z)
-        R[..., 1, 1] = 1 - 2 * (x * x + z * z)
-        R[..., 1, 2] = 2 * (y * z - r * x)
-        R[..., 2, 0] = 2 * (x * z - r * y)
-        R[..., 2, 1] = 2 * (y * z + r * x)
-        R[..., 2, 2] = 1 - 2 * (x * x + y * y)
+        # Build rotation matrix R
+        R = torch.zeros(n_gaussians, 3, 3, device=device, dtype=dtype)
+        R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+        R[:, 0, 1] = 2 * (x * y - r * z)
+        R[:, 0, 2] = 2 * (x * z + r * y)
+        R[:, 1, 0] = 2 * (x * y + r * z)
+        R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+        R[:, 1, 2] = 2 * (y * z - r * x)
+        R[:, 2, 0] = 2 * (x * z - r * y)
+        R[:, 2, 1] = 2 * (y * z + r * x)
+        R[:, 2, 2] = 1 - 2 * (x * x + y * y)
 
-        # Create diagonal scale matrix
-        L = torch.diag_embed(scales)  # [N, 3, 3]
+        # Build scale matrix S (diagonal)
+        S = torch.zeros(n_gaussians, 3, 3, device=device, dtype=dtype)
+        S[:, 0, 0] = scales[:, 0]
+        S[:, 1, 1] = scales[:, 1]
+        S[:, 2, 2] = scales[:, 2]
 
-        # Covariance = R @ L @ L^T @ R^T = R @ S @ R^T where S = L @ L^T
-        L = R @ L
-        covariance = L @ L.transpose(-1, -2)
-        return covariance
+        # Compute M = S @ R
+        M = torch.bmm(S, R)
+
+        # Compute covariance: Cov = M^T @ M
+        Cov = torch.bmm(M.transpose(-1, -2), M)
+
+        # Invert covariance to get precision matrix
+        # Note: GaussianFormer does this on CPU for numerical stability
+        CovInv = torch.linalg.inv(Cov)
+
+        # Pack as 6 elements: [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
+        # From flattened 3x3: indices [0, 4, 8, 1, 5, 2]
+        cov3D = CovInv.flatten(1)[:, [0, 4, 8, 1, 5, 2]]
+
+        # Compute radii: ceil(max_scale * sigma_factor / voxel_size)
+        radii = torch.ceil(
+            scales.max(dim=-1)[0] * self.sigma_factor / self.voxel_size
+        ).to(torch.int32)
+        # Ensure radii >= 1
+        radii = torch.clamp(radii, min=1)
+
+        return cov3D, radii
 
     def _unbatched_forward(
         self,
         means3d: torch.Tensor,
         opacities: torch.Tensor,
-        covariances: torch.Tensor,
+        cov3D: torch.Tensor,
+        radii: torch.Tensor,
         features: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for a single sample (no batch dimension)."""
@@ -173,8 +219,8 @@ class CUDAVoxelizer(nn.Module):
         # Pre-filter Gaussians
         if self.filter_gaussians:
             filtered = _filter_gaussians_torch(
-                means3d, opacities, covariances, features,
-                self.vol_range, self.opacity_thresh, self.sigma_factor
+                means3d, opacities, cov3D, radii, features,
+                self.vol_range, self.opacity_thresh
             )
             if filtered[0] is None:
                 # No valid Gaussians
@@ -182,12 +228,13 @@ class CUDAVoxelizer(nn.Module):
                 density = torch.zeros(*self.grid_shape, 1, device=device)
                 grid_feats = torch.zeros(*self.grid_shape, feat_dim, device=device) if feat_dim > 0 else None
                 return density, grid_feats
-            means3d, opacities, covariances, features = filtered
+            means3d, opacities, cov3D, radii, features = filtered
 
         # Ensure tensors are contiguous
         means3d = means3d.float().contiguous()
         opacities = opacities.float().contiguous()
-        covariances = covariances.float().contiguous()
+        cov3D = cov3D.float().contiguous()
+        radii = radii.int().contiguous()
         if features is not None:
             features = features.float().contiguous()
         else:
@@ -203,12 +250,12 @@ class CUDAVoxelizer(nn.Module):
             grid_density, grid_feats = self._cuda_ext.voxelize_gaussians(
                 means3d,
                 opacities,
-                covariances,
+                cov3D,
+                radii,
                 features,
                 self.grid_shape,
                 vol_range_list,
                 self.voxel_size,
-                self.sigma_factor,
                 self.eps
             )
             if grid_feats.numel() == 0:
@@ -216,7 +263,7 @@ class CUDAVoxelizer(nn.Module):
         else:
             # Fallback to PyTorch implementation
             grid_density, grid_feats = self._pytorch_fallback(
-                means3d, opacities, covariances, features
+                means3d, opacities, cov3D, radii, features
             )
 
         return grid_density, grid_feats
@@ -225,10 +272,14 @@ class CUDAVoxelizer(nn.Module):
         self,
         means3d: torch.Tensor,
         opacities: torch.Tensor,
-        covariances: torch.Tensor,
+        cov3D: torch.Tensor,
+        radii: torch.Tensor,
         features: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """PyTorch fallback when CUDA is not available."""
+        """PyTorch fallback when CUDA is not available.
+
+        Uses GaussianFormer-style Gaussian evaluation formula.
+        """
         device = means3d.device
         n_gaussians = means3d.size(0)
         vol_min = self.vol_range[:3]
@@ -238,28 +289,29 @@ class CUDAVoxelizer(nn.Module):
         feat_dim = features.size(-1) if features is not None and features.numel() > 0 else 0
         grid_feats = torch.zeros(*self.grid_shape, feat_dim, device=device) if feat_dim > 0 else None
 
-        # Compute inverse covariances
-        cov_inv = torch.linalg.inv(covariances)  # [N, 3, 3]
-
-        # Get sigma for bounds
-        sigma = torch.sqrt(torch.diagonal(covariances, dim1=1, dim2=2))  # [N, 3]
-
         for g in range(n_gaussians):
             mean = means3d[g]
-            sig = sigma[g]
+            radius = radii[g].item()
 
-            # Compute voxel index bounds
-            idx_min = ((mean - self.sigma_factor * sig - vol_min) / self.voxel_size).int()
-            idx_max = ((mean + self.sigma_factor * sig - vol_min) / self.voxel_size).int()
+            # Get precision matrix elements
+            cov_xx = cov3D[g, 0]
+            cov_yy = cov3D[g, 1]
+            cov_zz = cov3D[g, 2]
+            cov_xy = cov3D[g, 3]
+            cov_yz = cov3D[g, 4]
+            cov_xz = cov3D[g, 5]
 
-            idx_min = idx_min.clamp(min=0)
-            idx_max = torch.tensor(self.grid_shape, device=device) - 1
-            idx_max = idx_max.clamp(max=torch.tensor(self.grid_shape, device=device) - 1)
+            # Compute voxel index of mean
+            mean_idx = ((mean - vol_min) / self.voxel_size).int()
+
+            # Compute bounds
+            idx_min = (mean_idx - radius).clamp(min=0)
+            idx_max = (mean_idx + radius).clamp(
+                max=torch.tensor(self.grid_shape, device=device) - 1
+            )
 
             i_min, j_min, k_min = idx_min.tolist()
-            i_max, j_max, k_max = ((mean + self.sigma_factor * sig - vol_min) / self.voxel_size).int().clamp(
-                max=torch.tensor(self.grid_shape, device=device) - 1
-            ).tolist()
+            i_max, j_max, k_max = idx_max.tolist()
 
             if i_min > i_max or j_min > j_max or k_min > k_max:
                 continue
@@ -273,15 +325,18 @@ class CUDAVoxelizer(nn.Module):
             voxel_centers = torch.stack([ii, jj, kk], dim=-1)
             voxel_centers = voxel_centers * self.voxel_size + vol_min + 0.5 * self.voxel_size
 
-            # Compute Mahalanobis distance
-            diff = voxel_centers - mean  # [ni, nj, nk, 3]
-            diff_flat = diff.reshape(-1, 3)  # [n_voxels, 3]
-            maha = (diff_flat @ cov_inv[g] * diff_flat).sum(dim=-1)  # [n_voxels]
-            maha = maha.reshape(ii.shape)  # [ni, nj, nk]
+            # Compute diff: d = mean - voxel (GaussianFormer convention)
+            diff = mean - voxel_centers  # [ni, nj, nk, 3]
+            dx, dy, dz = diff[..., 0], diff[..., 1], diff[..., 2]
+
+            # GaussianFormer-style Gaussian evaluation:
+            # power = -0.5 * (Λ_xx*dx² + Λ_yy*dy² + Λ_zz*dz²) - (Λ_xy*dx*dy + Λ_yz*dy*dz + Λ_xz*dx*dz)
+            power = cov_xx * dx * dx + cov_yy * dy * dy + cov_zz * dz * dz
+            power = -0.5 * power - (cov_xy * dx * dy + cov_yz * dy * dz + cov_xz * dx * dz)
 
             # Compute contribution
             opac = opacities[g].squeeze() if opacities[g].dim() > 0 else opacities[g]
-            contrib = opac * torch.exp(-0.5 * maha)
+            contrib = opac * torch.exp(power)
 
             # Update grid
             grid_density[i_min:i_max+1, j_min:j_max+1, k_min:k_max+1, 0] += contrib
@@ -311,9 +366,9 @@ class CUDAVoxelizer(nn.Module):
         Args:
             means3d: Gaussian centers [B, N, 3].
             opacities: Gaussian opacities [B, N, 1].
-            covariances: Gaussian covariance matrices [B, N, 3, 3]. Optional.
-            scales: Gaussian scales [B, N, 3]. Used if covariances not provided.
-            rotations: Gaussian rotations [B, N, 4]. Used if covariances not provided.
+            covariances: DEPRECATED. Use scales and rotations instead.
+            scales: Gaussian scales [B, N, 3].
+            rotations: Gaussian rotations [B, N, 4] (quaternions).
             features: Gaussian features [B, N, C].
 
         Returns:
@@ -323,23 +378,27 @@ class CUDAVoxelizer(nn.Module):
         """
         batch_size = means3d.size(0)
 
-        # Compute covariances if not provided
-        if covariances is None:
-            # Flatten batch for covariance computation
-            scales_flat = scales.reshape(-1, 3)
-            rotations_flat = rotations.reshape(-1, 4)
-            covariances = self._get_covariance(scales_flat, rotations_flat)
-            covariances = covariances.reshape(batch_size, -1, 3, 3)
+        if scales is None or rotations is None:
+            raise ValueError(
+                "scales and rotations are required. "
+                "The covariances argument is deprecated."
+            )
 
         # Process each batch element
         densities = []
         feats_list = []
 
         for b in range(batch_size):
+            # Compute precision matrix and radii for this batch
+            cov3D, radii = self._prepare_gaussian_args(
+                scales[b], rotations[b]
+            )
+
             density, feats = self._unbatched_forward(
                 means3d[b],
                 opacities[b],
-                covariances[b],
+                cov3D,
+                radii,
                 features[b] if features is not None else None
             )
             densities.append(density)

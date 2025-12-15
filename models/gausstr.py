@@ -51,11 +51,12 @@ class GaussTRLightning(pl.LightningModule):
         head_text_protos: Optional[str] = "ckpts/text_proto_embeds_clip.pth",
         head_prompt_denoising: bool = True,
         head_num_segment_classes: int = 17,
-        # Voxelizer config
+        # Voxelizer config (defaults match original GaussTR)
         vol_range: List[float] = None,
         voxel_size: float = 0.4,
         filter_gaussians: bool = False,
-        opacity_thresh: float = 0,
+        opacity_thresh: float = 0.0,
+        sigma_factor: float = 3.0,
         # Training config
         learning_rate: float = 2e-4,
         weight_decay: float = 5e-3,
@@ -145,7 +146,8 @@ class GaussTRLightning(pl.LightningModule):
                 'vol_range': vol_range,
                 'voxel_size': voxel_size,
                 'filter_gaussians': filter_gaussians,
-                'opacity_thresh': opacity_thresh
+                'opacity_thresh': opacity_thresh,
+                'sigma_factor': sigma_factor,
             }
         }
         self.gauss_heads = nn.ModuleList([
