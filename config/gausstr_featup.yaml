@@ -19,8 +19,8 @@ work_dir: work_dirs/${experiment_name}  # Base work directory
 logger: "mlflow"  # Options: "mlflow", "tensorboard", "wandb"
 experiment_name: "gausstr_featup"
 run_name: null  # Optional: specific run name for MLflow (auto-generated if null)
-mlflow_tracking_uri: "sqlite:////mnt/nvme0/gausstr_lightning/mlflow.db"  # SQLite database (absolute path)
-mlflow_artifact_location: "/mnt/nvme0/gausstr_lightning/work_dirs/mlflow_artifacts"  # Artifact storage
+mlflow_tracking_uri: "sqlite:///mlruns/mlflow.db"  # SQLite database
+mlflow_artifact_location: "mlruns/artifacts"  # Artifact storage
 use_rich_progress: true
 early_stopping: false
 test_after_training: true
@@ -50,7 +50,7 @@ model:
   head_depth_limit: 51.2
   head_text_protos: "ckpts/text_proto_embeds_clip.pth"
   head_prompt_denoising: true
-  head_num_segment_classes: 17
+  head_num_segment_classes: 18
 
   # Voxelizer config
   vol_range: [-40, -40, -1, 40, 40, 5.4]
@@ -78,9 +78,9 @@ data:
   val_ann_file: "/mnt/nvme0/data/nuscenes/nuscenes_infos_val.pkl"
   input_size: [432, 768]
   resize_lim: [0.48, 0.48]
-  depth_root: "/mnt/nvme0/data/nuscenes_moge"
+  depth_root: "/mnt/nvme0/data/nuscenes_unidepth"
   feats_root: "/mnt/nvme0/data/nuscenes_featup"
-  sem_seg_root: "/mnt/nvme0/data/nuscenes_grounded_sam2"
+  sem_seg_root: "/mnt/nvme0/data/nuscenes_sam3"
   batch_size: 2  # bs=4: num_workers=8, lr=0.0004, warmup_iters=100
   num_workers: 4  # bs=4: 8
   pin_memory: true

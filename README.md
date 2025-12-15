@@ -69,6 +69,26 @@ After successful compilation, you should see `.so` files in each directory:
 
 **Supported GPU architectures:** V100 (sm_70), T4 (sm_75), A100 (sm_80), RTX 3090 (sm_86), RTX 4090 (sm_89), H100 (sm_90)
 
+### Pre-compile gsplat CUDA Extensions (Important for Multi-GPU)
+
+The [gsplat](https://github.com/nerfstudio-project/gsplat) library uses JIT (Just-In-Time) compilation for its CUDA kernels. When running multi-GPU training with DDP, all processes may try to compile simultaneously, causing race conditions and cache corruption.
+
+**Solution:** Pre-compile gsplat before running multi-GPU training:
+
+```bash
+# Pre-compile gsplat CUDA extensions (run once before training)
+CUDA_VISIBLE_DEVICES=0 python -c "from gsplat.cuda._backend import _C; print('gsplat compiled!')"
+```
+
+This creates a cached `.so` file at `~/.cache/torch_extensions/py3XX_cuXXX/gsplat_cuda/gsplat_cuda.so`. The compilation takes ~1 minute on first run.
+
+**If you encounter gsplat errors during DDP training:**
+```bash
+# Clean corrupted cache and recompile
+rm -rf ~/.cache/torch_extensions/py3*/gsplat_cuda
+CUDA_VISIBLE_DEVICES=0 python -c "from gsplat.cuda._backend import _C"
+```
+
 ### Dataset Preparation
 
 1. Download or manually prepare the nuScenes dataset following the instructions in the [mmdetection3d docs](https://mmdetection3d.readthedocs.io/en/latest/user_guides/dataset_prepare.html#nuscenes) and place it in `data/nuscenes`.
@@ -129,8 +149,8 @@ python -m scripts.test checkpoint=ckpts/gausstr_featup.pth
 This implementation uses MLflow for experiment tracking by default:
 
 ```bash
-# Launch MLflow UI
-mlflow ui --backend-store-uri sqlite:////mnt/nvme0/gausstr_lightning/mlflow.db
+# Launch MLflow UI (from project root)
+mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db
 ```
 
 ## Citation
