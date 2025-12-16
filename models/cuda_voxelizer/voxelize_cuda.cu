@@ -13,6 +13,8 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -334,6 +336,10 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     float voxel_size,
     float eps
 ) {
+    // Set CUDA device guard for multi-GPU support
+    const at::cuda::CUDAGuard device_guard(means3d.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
     // Ensure inputs are contiguous
     means3d = means3d.contiguous().to(torch::kFloat32);
     opacities = opacities.contiguous().to(torch::kFloat32).view({-1});
@@ -368,7 +374,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     torch::Tensor tiles_touched = torch::zeros({P}, options_uint);
 
     int blocks = (P + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    preprocessKernel<<<blocks, THREADS_PER_BLOCK>>>(
+    preprocessKernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(
         P,
         means3d_int.data_ptr<int>(),
         radii.data_ptr<int>(),
@@ -379,14 +385,14 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     // Step 2: Prefix sum to get offsets
     torch::Tensor offsets = torch::zeros({P}, options_uint);
 
-    // Use CUB for prefix sum
+    // Use CUB for prefix sum (with stream for multi-GPU support)
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(
         d_temp_storage, temp_storage_bytes,
         reinterpret_cast<uint32_t*>(tiles_touched.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(offsets.data_ptr<int>()),
-        P
+        P, stream
     );
     torch::Tensor temp_storage = torch::empty({(int64_t)temp_storage_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
     cub::DeviceScan::InclusiveSum(
@@ -394,13 +400,14 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
         temp_storage_bytes,
         reinterpret_cast<uint32_t*>(tiles_touched.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(offsets.data_ptr<int>()),
-        P
+        P, stream
     );
 
-    // Get total number of pairs
+    // Get total number of pairs (sync stream before memcpy for correct results)
     int num_pairs = 0;
     if (P > 0) {
-        cudaMemcpy(&num_pairs, offsets.data_ptr<int>() + P - 1, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&num_pairs, offsets.data_ptr<int>() + P - 1, sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
     }
 
     if (num_pairs == 0) {
@@ -416,7 +423,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     torch::Tensor keys_unsorted = torch::empty({num_pairs}, options_uint);
     torch::Tensor values_unsorted = torch::empty({num_pairs}, options_uint);
 
-    duplicateWithKeysKernel<<<blocks, THREADS_PER_BLOCK>>>(
+    duplicateWithKeysKernel<<<blocks, THREADS_PER_BLOCK, 0, stream>>>(
         P,
         means3d_int.data_ptr<int>(),
         radii.data_ptr<int>(),
@@ -437,7 +444,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
         reinterpret_cast<uint32_t*>(keys_sorted.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(values_unsorted.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(values_sorted.data_ptr<int>()),
-        num_pairs
+        num_pairs, 0, sizeof(uint32_t) * 8, stream
     );
     temp_storage = torch::empty({(int64_t)temp_storage_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
     cub::DeviceRadixSort::SortPairs(
@@ -447,7 +454,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
         reinterpret_cast<uint32_t*>(keys_sorted.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(values_unsorted.data_ptr<int>()),
         reinterpret_cast<uint32_t*>(values_sorted.data_ptr<int>()),
-        num_pairs
+        num_pairs, 0, sizeof(uint32_t) * 8, stream
     );
 
     // Step 5: Identify ranges for each voxel
@@ -455,7 +462,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     torch::Tensor ranges = torch::zeros({num_voxels, 2}, options_uint);
 
     int range_blocks = (num_pairs + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    identifyRangesKernel<<<range_blocks, THREADS_PER_BLOCK>>>(
+    identifyRangesKernel<<<range_blocks, THREADS_PER_BLOCK, 0, stream>>>(
         num_pairs,
         reinterpret_cast<uint32_t*>(keys_sorted.data_ptr<int>()),
         reinterpret_cast<uint2*>(ranges.data_ptr<int>())
@@ -482,7 +489,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     int render_blocks = (num_voxels + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     if (feat_dim == 128) {
-        renderKernel<128><<<render_blocks, THREADS_PER_BLOCK>>>(
+        renderKernel<128><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
             num_voxels,
             voxel_centers.data_ptr<float>(),
             reinterpret_cast<uint2*>(ranges.data_ptr<int>()),
@@ -495,7 +502,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
             has_features ? out_features.data_ptr<float>() : nullptr
         );
     } else if (feat_dim == 256) {
-        renderKernel<256><<<render_blocks, THREADS_PER_BLOCK>>>(
+        renderKernel<256><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
             num_voxels,
             voxel_centers.data_ptr<float>(),
             reinterpret_cast<uint2*>(ranges.data_ptr<int>()),
@@ -508,7 +515,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
             has_features ? out_features.data_ptr<float>() : nullptr
         );
     } else if (feat_dim == 512) {
-        renderKernel<512><<<render_blocks, THREADS_PER_BLOCK>>>(
+        renderKernel<512><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
             num_voxels,
             voxel_centers.data_ptr<float>(),
             reinterpret_cast<uint2*>(ranges.data_ptr<int>()),
@@ -523,7 +530,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     } else if (feat_dim > 0) {
         // Generic kernel with shared memory for features
         size_t shared_mem = THREADS_PER_BLOCK * feat_dim * sizeof(float);
-        renderKernelGeneric<<<render_blocks, THREADS_PER_BLOCK, shared_mem>>>(
+        renderKernelGeneric<<<render_blocks, THREADS_PER_BLOCK, shared_mem, stream>>>(
             num_voxels,
             feat_dim,
             voxel_centers.data_ptr<float>(),
@@ -538,7 +545,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
         );
     } else {
         // No features, just density
-        renderKernel<0><<<render_blocks, THREADS_PER_BLOCK>>>(
+        renderKernel<0><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
             num_voxels,
             voxel_centers.data_ptr<float>(),
             reinterpret_cast<uint2*>(ranges.data_ptr<int>()),
@@ -555,22 +562,22 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     // Step 8: Normalize features by density
     if (has_features) {
         if (feat_dim == 128) {
-            normalizeKernel<128><<<render_blocks, THREADS_PER_BLOCK>>>(
+            normalizeKernel<128><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
                 num_voxels, out_density.data_ptr<float>(),
                 out_features.data_ptr<float>(), eps
             );
         } else if (feat_dim == 256) {
-            normalizeKernel<256><<<render_blocks, THREADS_PER_BLOCK>>>(
+            normalizeKernel<256><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
                 num_voxels, out_density.data_ptr<float>(),
                 out_features.data_ptr<float>(), eps
             );
         } else if (feat_dim == 512) {
-            normalizeKernel<512><<<render_blocks, THREADS_PER_BLOCK>>>(
+            normalizeKernel<512><<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
                 num_voxels, out_density.data_ptr<float>(),
                 out_features.data_ptr<float>(), eps
             );
         } else {
-            normalizeKernelGeneric<<<render_blocks, THREADS_PER_BLOCK>>>(
+            normalizeKernelGeneric<<<render_blocks, THREADS_PER_BLOCK, 0, stream>>>(
                 num_voxels, feat_dim, out_density.data_ptr<float>(),
                 out_features.data_ptr<float>(), eps
             );
