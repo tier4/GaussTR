@@ -188,9 +188,9 @@ class CUDAVoxelizer(nn.Module):
         # Compute covariance: Cov = M^T @ M
         Cov = torch.bmm(M.transpose(-1, -2), M)
 
-        # Invert covariance to get precision matrix
-        # Note: GaussianFormer does this on CPU for numerical stability
-        CovInv = torch.linalg.inv(Cov)
+        # Invert covariance to get precision matrix (GaussianFormer style)
+        # Move to CPU and use float32 for numerical stability, then back to GPU
+        CovInv = Cov.cpu().float().inverse().to(device=device, dtype=dtype)
 
         # Pack as 6 elements: [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
         # From flattened 3x3: indices [0, 4, 8, 1, 5, 2]
@@ -289,11 +289,14 @@ class CUDAVoxelizer(nn.Module):
         feat_dim = features.size(-1) if features is not None and features.numel() > 0 else 0
         grid_feats = torch.zeros(*self.grid_shape, feat_dim, device=device) if feat_dim > 0 else None
 
+        # Pre-convert radii to CPU list to avoid GPU-CPU sync per iteration
+        radii_list = radii.cpu().tolist()
+
         for g in range(n_gaussians):
             mean = means3d[g]
-            radius = radii[g].item()
+            radius = radii_list[g]
 
-            # Get precision matrix elements
+            # Get precision matrix elements from pre-loaded CPU tensor
             cov_xx = cov3D[g, 0]
             cov_yy = cov3D[g, 1]
             cov_zz = cov3D[g, 2]
@@ -304,14 +307,14 @@ class CUDAVoxelizer(nn.Module):
             # Compute voxel index of mean
             mean_idx = ((mean - vol_min) / self.voxel_size).int()
 
-            # Compute bounds
+            # Compute bounds (use integer radius to avoid sync)
             idx_min = (mean_idx - radius).clamp(min=0)
-            idx_max = (mean_idx + radius).clamp(
-                max=torch.tensor(self.grid_shape, device=device) - 1
-            )
+            idx_max = (mean_idx + radius + 1).clamp(
+                max=torch.tensor(self.grid_shape, device=device)
+            ) - 1
 
-            i_min, j_min, k_min = idx_min.tolist()
-            i_max, j_max, k_max = idx_max.tolist()
+            i_min, j_min, k_min = idx_min.cpu().tolist()
+            i_max, j_max, k_max = idx_max.cpu().tolist()
 
             if i_min > i_max or j_min > j_max or k_min > k_max:
                 continue
