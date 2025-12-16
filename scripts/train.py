@@ -54,8 +54,10 @@ del _glob, _setup_cuda, _local_rank
 # Set MLflow tracking URI and artifact root via environment variables BEFORE any imports
 # This ensures all DDP worker processes use the database instead of creating mlruns/
 # Use direct assignment (not setdefault) to override any existing value
-os.environ['MLFLOW_TRACKING_URI'] = 'sqlite:////mnt/nvme0/gausstr_lightning/mlflow.db'
-os.environ['MLFLOW_ARTIFACT_ROOT'] = '/mnt/nvme0/gausstr_lightning/work_dirs/mlflow_artifacts'
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ['MLFLOW_TRACKING_URI'] = f'sqlite:///{_project_root}/mlruns/mlflow.db'
+os.environ['MLFLOW_ARTIFACT_ROOT'] = f'{_project_root}/mlruns/mlflow_artifacts'
+del _project_root
 
 import sys
 import warnings
