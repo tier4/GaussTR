@@ -68,7 +68,7 @@ work_dirs/
 ckpts/
 
 # Data directories
-data/
+data
 
 # MLflow (mlruns/ is legacy - we use sqlite:// backend)
 mlruns/
