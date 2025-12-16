@@ -71,10 +71,10 @@ def _register_custom_ops():
     # Define the library for our custom ops (stored globally to prevent GC)
     _voxelizer_lib = torch.library.Library("voxelizer", "DEF")
 
-    # Define op schema - note: List[int] for grid_shape, List[float] for vol_range
+    # Define op schema - note: List[int] for grid_shape, List[float] for vol_range and voxel_size
     _voxelizer_lib.define(
         "voxelize_gaussians(Tensor means3d, Tensor opacities, Tensor cov3D, Tensor radii, "
-        "Tensor features, int[] grid_shape, float[] vol_range, float voxel_size, float eps) -> (Tensor, Tensor)"
+        "Tensor features, int[] grid_shape, float[] vol_range, float[] voxel_size, float eps) -> (Tensor, Tensor)"
     )
 
     # Create implementation library (stored globally to prevent GC)
@@ -89,7 +89,7 @@ def _register_custom_ops():
         features: Tensor,
         grid_shape: List[int],
         vol_range: List[float],
-        voxel_size: float,
+        voxel_size: List[float],
         eps: float
     ) -> Tuple[Tensor, Tensor]:
         return _cuda_ext.voxelize_gaussians(
@@ -109,7 +109,7 @@ def _register_custom_ops():
         features: Tensor,
         grid_shape: List[int],
         vol_range: List[float],
-        voxel_size: float,
+        voxel_size: List[float],
         eps: float
     ) -> Tuple[Tensor, Tensor]:
         # Output shapes: [X, Y, Z, 1] for density, [X, Y, Z, feat_dim] for features
@@ -194,16 +194,28 @@ class CUDAVoxelizer(nn.Module):
         eps=1e-6
     ):
         super().__init__()
-        self.voxel_size = voxel_size
         self.sigma_factor = sigma_factor
         self.eps = eps
         vol_range = torch.tensor(vol_range, dtype=torch.float32)
         self.register_buffer('vol_range', vol_range)
 
+        # Handle voxel_size: scalar -> [v, v, v], list -> tensor
+        if isinstance(voxel_size, (int, float)):
+            voxel_size = torch.tensor([voxel_size, voxel_size, voxel_size], dtype=torch.float32)
+        elif isinstance(voxel_size, (list, tuple)):
+            voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
+        elif isinstance(voxel_size, torch.Tensor) and voxel_size.dim() == 0:
+            # Scalar tensor -> expand to 3D
+            voxel_size = voxel_size.float().expand(3).clone()
+        self.register_buffer('voxel_size', voxel_size)
+
         # Compute grid shape
         self.grid_shape = ((vol_range[3:] - vol_range[:3]) / voxel_size).int().tolist()
         self.filter_gaussians = filter_gaussians
         self.opacity_thresh = opacity_thresh
+
+        # Cache indices for precision matrix packing (avoids tensor creation every forward)
+        self.register_buffer('_cov_indices', torch.tensor([0, 4, 8, 1, 5, 2], dtype=torch.long))
 
         # Check CUDA availability
         self._cuda_ext = None
@@ -215,8 +227,8 @@ class CUDAVoxelizer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute precision matrix and radii from scales and rotations.
 
-        This follows GaussianFormer's implementation:
-        1. Compute covariance: Cov = R @ S @ S^T @ R^T = (S @ R)^T @ (S @ R)
+        Steps:
+        1. Compute covariance: Cov = R @ S @ S^T @ R^T = (R @ S) @ (R @ S)^T
         2. Invert to get precision matrix: CovInv = Cov^(-1)
         3. Pack as 6 elements: [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
         4. Compute radii from scales
@@ -255,23 +267,25 @@ class CUDAVoxelizer(nn.Module):
         S[:, 1, 1] = scales[:, 1]
         S[:, 2, 2] = scales[:, 2]
 
-        # Compute M = S @ R
-        M = torch.bmm(S, R)
+        # Compute M = R @ S
+        M = torch.bmm(R, S)
 
-        # Compute covariance: Cov = M^T @ M
-        Cov = torch.bmm(M.transpose(-1, -2), M)
+        # Compute covariance: Cov = M @ M^T = R @ S² @ R^T
+        Cov = torch.bmm(M, M.transpose(-1, -2))
 
         # Invert covariance to get precision matrix (GaussianFormer style)
-        # Move to CPU and use float32 for numerical stability, then back to GPU
-        CovInv = Cov.cpu().float().inverse().to(device=device, dtype=dtype)
+        # Use FP32 on GPU for numerical stability (disable autocast to avoid FP16)
+        with torch.amp.autocast('cuda', enabled=False):
+            CovInv = torch.linalg.inv(Cov.float()).to(dtype=dtype)
 
         # Pack as 6 elements: [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
-        indices = torch.tensor([0, 4, 8, 1, 5, 2], device=device, dtype=torch.long)
-        cov3D = CovInv.flatten(1).index_select(1, indices)
+        cov3D = CovInv.flatten(1).index_select(1, self._cov_indices)
 
-        # Compute radii: ceil(max_scale * sigma_factor / voxel_size)
+        # Compute radii: ceil(max_scale * sigma_factor / min_voxel_size)
+        # Use minimum voxel size to be conservative (covers all dimensions)
+        min_voxel_size = self.voxel_size.min() if isinstance(self.voxel_size, torch.Tensor) else min(self.voxel_size)
         radii = torch.ceil(
-            scales.max(dim=-1)[0] * self.sigma_factor / self.voxel_size
+            scales.max(dim=-1)[0] * self.sigma_factor / min_voxel_size
         ).to(torch.int32)
         # Ensure radii >= 1
         radii = torch.clamp(radii, min=1)
@@ -319,6 +333,7 @@ class CUDAVoxelizer(nn.Module):
 
         if self._cuda_ext is not None and means3d.is_cuda:
             vol_range_list = self.vol_range.tolist()
+            voxel_size_list = self.voxel_size.tolist()
             grid_density, grid_feats = torch.ops.voxelizer.voxelize_gaussians(
                 means3d,
                 opacities,
@@ -327,7 +342,7 @@ class CUDAVoxelizer(nn.Module):
                 features,
                 self.grid_shape,
                 vol_range_list,
-                self.voxel_size,
+                voxel_size_list,
                 self.eps
             )
             if grid_feats.numel() == 0:
@@ -452,6 +467,7 @@ class CUDAVoxelizer(nn.Module):
                 - features: [B, X, Y, Z, C] or None
         """
         batch_size = means3d.size(0)
+        n_gaussians = means3d.size(1)
 
         if scales is None or rotations is None:
             raise ValueError(
@@ -459,21 +475,26 @@ class CUDAVoxelizer(nn.Module):
                 "The covariances argument is deprecated."
             )
 
-        # Process each batch element
+        # Batch compute precision matrix and radii for ALL gaussians at once
+        # This avoids kernel launch overhead from per-batch processing
+        cov3D_all, radii_all = self._prepare_gaussian_args(
+            scales.reshape(-1, 3),  # [B*N, 3]
+            rotations.reshape(-1, 4)  # [B*N, 4]
+        )
+        # Reshape back to per-batch
+        cov3D_all = cov3D_all.reshape(batch_size, n_gaussians, 6)
+        radii_all = radii_all.reshape(batch_size, n_gaussians)
+
+        # Process each batch element (CUDA kernel requires unbatched input)
         densities = []
         feats_list = []
 
         for b in range(batch_size):
-            # Compute precision matrix and radii for this batch
-            cov3D, radii = self._prepare_gaussian_args(
-                scales[b], rotations[b]
-            )
-
             density, feats = self._unbatched_forward(
                 means3d[b],
                 opacities[b],
-                cov3D,
-                radii,
+                cov3D_all[b],
+                radii_all[b],
                 features[b] if features is not None else None
             )
             densities.append(density)

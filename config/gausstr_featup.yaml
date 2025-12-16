@@ -75,8 +75,8 @@ model:
   std: [58.395, 57.12, 57.375]
 
   # Performance optimizations
-  torch_compile: true  # Enable torch.compile() for 15-30% speedup (requires PyTorch 2.0+)
-  compile_mode: "max-autotune"  # Options: "default", "reduce-overhead", "max-autotune"
+  torch_compile: false  # Disabled - may conflict with custom CUDA ops
+  compile_mode: "reduce-overhead"  # Options: "default", "reduce-overhead", "max-autotune"
 
 # Data configuration
 data:
@@ -85,9 +85,9 @@ data:
   val_ann_file: "/mnt/nvme0/data/nuscenes/nuscenes_infos_val.pkl"
   input_size: [432, 768]
   resize_lim: [0.48, 0.48]
-  depth_root: "/mnt/nvme0/data/nuscenes_unidepth"
+  depth_root: "/mnt/nvme0/data/nuscenes_metric3d"
   feats_root: "/mnt/nvme0/data/nuscenes_featup"
-  sem_seg_root: "/mnt/nvme0/data/nuscenes_sam3"
+  sem_seg_root: "/mnt/nvme0/data/nuscenes_grounded_sam2"
   batch_size: 2  # bs=4: num_workers=8, lr=0.0004, warmup_iters=100
   num_workers: 4  # bs=4: 8
   pin_memory: true

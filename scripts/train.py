@@ -85,6 +85,9 @@ warnings.filterwarnings("ignore", message=".*Default grid_sample and affine_grid
 # Suppress lr_scheduler.step() warning - this is expected in Lightning with step-based scheduling
 # The warning is misleading: Lightning handles optimizer/scheduler ordering correctly internally
 warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*optimizer.step.*")
+# Suppress DDP gradient stride mismatch warning for 1x1 convolutions
+# This is a known PyTorch issue with 1x1 Conv2d layers - harmless, minimal performance impact
+warnings.filterwarnings("ignore", message=".*Grad strides do not match bucket view strides.*")
 
 # Enable Tensor Core optimization for better performance on supported GPUs (H100, A100, etc.)
 torch.set_float32_matmul_precision('high')

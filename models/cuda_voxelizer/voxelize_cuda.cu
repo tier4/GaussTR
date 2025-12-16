@@ -290,6 +290,7 @@ __global__ void renderKernelGeneric(
 }
 
 // Kernel: Normalize features by density
+// Always normalize by max(density, eps) to match PyTorch behavior
 template <int FEAT_DIM>
 __global__ void normalizeKernel(
     const int num_voxels,
@@ -301,12 +302,10 @@ __global__ void normalizeKernel(
     if (idx >= num_voxels) return;
 
     float d = density[idx];
-    if (d > eps) {
-        float inv_d = 1.0f / d;
-        #pragma unroll
-        for (int f = 0; f < FEAT_DIM; f++) {
-            features[idx * FEAT_DIM + f] *= inv_d;
-        }
+    float inv_d = 1.0f / fmaxf(d, eps);  // Always normalize, clamp density to eps
+    #pragma unroll
+    for (int f = 0; f < FEAT_DIM; f++) {
+        features[idx * FEAT_DIM + f] *= inv_d;
     }
 }
 
@@ -321,11 +320,9 @@ __global__ void normalizeKernelGeneric(
     if (idx >= num_voxels) return;
 
     float d = density[idx];
-    if (d > eps) {
-        float inv_d = 1.0f / d;
-        for (int f = 0; f < feat_dim; f++) {
-            features[idx * feat_dim + f] *= inv_d;
-        }
+    float inv_d = 1.0f / fmaxf(d, eps);  // Always normalize, clamp density to eps
+    for (int f = 0; f < feat_dim; f++) {
+        features[idx * feat_dim + f] *= inv_d;
     }
 }
 
@@ -338,7 +335,7 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     torch::Tensor features,     // [P, C] or empty
     std::vector<int64_t> grid_shape,  // [X, Y, Z]
     std::vector<float> vol_range,     // [xmin, ymin, zmin, xmax, ymax, zmax]
-    float voxel_size,
+    std::vector<float> voxel_size,    // [vx, vy, vz] - per-dimension voxel size
     float eps
 ) {
     // Set CUDA device guard for multi-GPU support
@@ -371,9 +368,13 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     float vol_min_x = vol_range[0];
     float vol_min_y = vol_range[1];
     float vol_min_z = vol_range[2];
+    float voxel_size_x = voxel_size[0];
+    float voxel_size_y = voxel_size[1];
+    float voxel_size_z = voxel_size[2];
 
-    // Step 0: Convert means3d to integer voxel coordinates
-    torch::Tensor means3d_int = ((means3d - torch::tensor({vol_min_x, vol_min_y, vol_min_z}, options_float)) / voxel_size).to(torch::kInt32);
+    // Step 0: Convert means3d to integer voxel coordinates (per-dimension voxel size)
+    torch::Tensor voxel_size_tensor = torch::tensor({voxel_size_x, voxel_size_y, voxel_size_z}, options_float);
+    torch::Tensor means3d_int = ((means3d - torch::tensor({vol_min_x, vol_min_y, vol_min_z}, options_float)) / voxel_size_tensor).to(torch::kInt32);
 
     // Step 1: Preprocess - count voxels touched per Gaussian
     torch::Tensor tiles_touched = torch::zeros({P}, options_uint);
@@ -473,13 +474,13 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
         reinterpret_cast<uint2*>(ranges.data_ptr<int>())
     );
 
-    // Step 6: Generate voxel centers
+    // Step 6: Generate voxel centers (per-dimension voxel size, matching PyTorch)
     torch::Tensor voxel_centers = torch::empty({num_voxels, 3}, options_float);
     {
-        // Generate grid of voxel centers
-        auto x_coords = torch::arange(0, grid_x, options_float) * voxel_size + vol_min_x + 0.5f * voxel_size;
-        auto y_coords = torch::arange(0, grid_y, options_float) * voxel_size + vol_min_y + 0.5f * voxel_size;
-        auto z_coords = torch::arange(0, grid_z, options_float) * voxel_size + vol_min_z + 0.5f * voxel_size;
+        // Generate grid of voxel centers: idx * voxel_size + vol_min + 0.5 * voxel_size
+        auto x_coords = torch::arange(0, grid_x, options_float) * voxel_size_x + vol_min_x + 0.5f * voxel_size_x;
+        auto y_coords = torch::arange(0, grid_y, options_float) * voxel_size_y + vol_min_y + 0.5f * voxel_size_y;
+        auto z_coords = torch::arange(0, grid_z, options_float) * voxel_size_z + vol_min_z + 0.5f * voxel_size_z;
 
         auto grid = torch::meshgrid({x_coords, y_coords, z_coords}, "ij");
         voxel_centers = torch::stack({grid[0].flatten(), grid[1].flatten(), grid[2].flatten()}, 1).contiguous();

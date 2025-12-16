@@ -163,23 +163,36 @@ class GaussTRLightning(pl.LightningModule):
             self.neck = torch.compile(self.neck, mode=compile_mode)
             self.decoder = torch.compile(self.decoder, mode=compile_mode)
 
-        # Fix DDP gradient stride mismatch for 1x1 convolutions
-        self._register_contiguous_grad_hooks()
+    def _forward_features(
+        self,
+        feats: torch.Tensor,
+        batch_size: int
+    ) -> Dict[str, torch.Tensor]:
+        """Shared feature extraction through neck and decoder.
 
-    def _register_contiguous_grad_hooks(self):
-        """Register hooks to make gradients contiguous for 1x1 convolutions.
+        Args:
+            feats: Pre-extracted features [B, N, C, H, W].
+            batch_size: Batch size.
 
-        This fixes the DDP warning about gradient strides not matching bucket view strides,
-        which occurs with 1x1 Conv2d layers where the gradient memory layout differs from
-        the expected contiguous layout.
+        Returns:
+            Dictionary with hidden_states and references from decoder.
         """
-        def make_contiguous_hook(grad):
-            return grad.contiguous() if grad is not None and not grad.is_contiguous() else grad
+        # Use pre-extracted features
+        x = feats.flatten(0, 1)
 
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                if module.kernel_size == (1, 1) and module.weight.requires_grad:
-                    module.weight.register_hook(make_contiguous_hook)
+        # Multi-scale features
+        multi_scale_feats = self.neck(x)
+
+        # Prepare decoder inputs
+        decoder_inputs = self.pre_transformer(multi_scale_feats)
+        feat_flatten = flatten_multi_scale_feats(multi_scale_feats)[0]
+        decoder_inputs.update(self.pre_decoder(feat_flatten, batch_size))
+
+        # Forward through decoder
+        return self.forward_decoder(
+            reg_branches=[h.regress_head for h in self.gauss_heads],
+            **decoder_inputs
+        )
 
     def forward(
         self,
@@ -206,23 +219,8 @@ class GaussTRLightning(pl.LightningModule):
         """
         bs, n = images.shape[:2]
 
-        # Use pre-extracted features
-        x = feats.flatten(0, 1)
-
-        # Multi-scale features
-        multi_scale_feats = self.neck(x)
-
-        # Prepare decoder inputs
-        decoder_inputs = self.pre_transformer(multi_scale_feats)
-        feat_flatten = flatten_multi_scale_feats(multi_scale_feats)[0]
-        decoder_inputs.update(self.pre_decoder(feat_flatten, bs))
-
-        # Forward through decoder
-        decoder_outputs = self.forward_decoder(
-            reg_branches=[h.regress_head for h in self.gauss_heads],
-            **decoder_inputs
-        )
-
+        # Forward through neck and decoder
+        decoder_outputs = self._forward_features(feats, bs)
         query = decoder_outputs['hidden_states']
         reference_points = decoder_outputs['references']
 
@@ -274,23 +272,8 @@ class GaussTRLightning(pl.LightningModule):
 
         bs, n = images.shape[:2]
 
-        # Use pre-extracted features
-        x = feats.flatten(0, 1)
-
-        # Multi-scale features
-        multi_scale_feats = self.neck(x)
-
-        # Prepare decoder inputs
-        decoder_inputs = self.pre_transformer(multi_scale_feats)
-        feat_flatten = flatten_multi_scale_feats(multi_scale_feats)[0]
-        decoder_inputs.update(self.pre_decoder(feat_flatten, bs))
-
-        # Forward through decoder
-        decoder_outputs = self.forward_decoder(
-            reg_branches=[h.regress_head for h in self.gauss_heads],
-            **decoder_inputs
-        )
-
+        # Forward through neck and decoder (shared with inference)
+        decoder_outputs = self._forward_features(feats, bs)
         query = decoder_outputs['hidden_states']
         reference_points = decoder_outputs['references']
 

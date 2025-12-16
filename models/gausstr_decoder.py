@@ -25,7 +25,8 @@ def coordinate_to_encoding(
     coord_tensor: torch.Tensor,
     num_feats: int = 128,
     temperature: int = 10000,
-    scale: float = 2 * math.pi
+    scale: float = 2 * math.pi,
+    dim_t: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Convert coordinate tensor to positional encoding.
 
@@ -35,13 +36,15 @@ def coordinate_to_encoding(
             Final dimension is 2x or 4x this value.
         temperature: Temperature for scaling position embedding.
         scale: Scale factor for position embedding.
+        dim_t: Pre-computed temperature scaling tensor. If None, computed on the fly.
 
     Returns:
         Positional encoding tensor.
     """
-    dim_t = torch.arange(
-        num_feats, dtype=torch.float32, device=coord_tensor.device)
-    dim_t = temperature**(2 * (dim_t // 2) / num_feats)
+    if dim_t is None:
+        dim_t = torch.arange(
+            num_feats, dtype=torch.float32, device=coord_tensor.device)
+        dim_t = temperature**(2 * (dim_t // 2) / num_feats)
 
     x_embed = coord_tensor[..., 0] * scale
     y_embed = coord_tensor[..., 1] * scale
@@ -363,6 +366,13 @@ class GaussTRDecoder(nn.Module):
         # Reference point head for positional encoding
         self.ref_point_head = MLP(embed_dims, embed_dims, embed_dims, 2)
 
+        # Cache positional encoding temperature scaling tensor (avoids recomputation)
+        num_feats = embed_dims // 2
+        temperature = 10000
+        dim_t = torch.arange(num_feats, dtype=torch.float32)
+        dim_t = temperature**(2 * (dim_t // 2) / num_feats)
+        self.register_buffer('_pos_enc_dim_t', dim_t)
+
         # Final layer norm
         self.norm = nn.LayerNorm(embed_dims)
 
@@ -409,10 +419,11 @@ class GaussTRDecoder(nn.Module):
                 reference_points_input = \
                     reference_points[:, :, None] * valid_ratios[:, None]
 
-            # Compute positional encoding from reference points
+            # Compute positional encoding from reference points (using cached dim_t)
             query_sine_embed = coordinate_to_encoding(
                 reference_points_input[:, :, 0, :],
-                query.size(-1) // 2)
+                query.size(-1) // 2,
+                dim_t=self._pos_enc_dim_t)
             query_pos = self.ref_point_head(query_sine_embed)
 
             # Apply decoder layer

@@ -245,7 +245,8 @@ class GaussTRHead(nn.Module):
         # Add channel dim temporarily for grid_sample (original: depth[:, :n, None])
         sample_depth = flatten_bsn_forward(
             F.grid_sample, depth[:, :n, None],
-            ref_pts.unsqueeze(2) * 2 - 1)
+            ref_pts.unsqueeze(2) * 2 - 1,
+            mode='bilinear', align_corners=False)
         sample_depth = sample_depth[:, :, 0, 0, :, None]
 
         # Compute 3D points from 2D reference points + depth

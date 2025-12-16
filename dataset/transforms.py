@@ -247,6 +247,7 @@ class LoadFeatMaps:
         key: Key name for storing features in results.
         apply_aug: Whether to apply image augmentation to features.
         suffix: Optional suffix for feature filenames.
+        use_mmap: Use memory-mapped loading for large datasets (reduces RAM usage).
     """
 
     def __init__(
@@ -254,12 +255,14 @@ class LoadFeatMaps:
         data_root: str,
         key: str,
         apply_aug: bool = False,
-        suffix: str = ''
+        suffix: str = '',
+        use_mmap: bool = False
     ):
         self.data_root = data_root
         self.key = key
         self.apply_aug = apply_aug
         self.suffix = suffix
+        self.use_mmap = use_mmap
 
     def __call__(self, results: Dict) -> Dict:
         """Load feature maps for all views."""
@@ -271,7 +274,12 @@ class LoadFeatMaps:
             basename = os.path.basename(filename).split('.')[0]
             feat_path = os.path.join(self.data_root, basename + self.suffix + '.npy')
 
-            feat = np.load(feat_path)
+            # Use memory-mapped loading if enabled (lazy loading, OS handles caching)
+            if self.use_mmap:
+                feat = np.load(feat_path, mmap_mode='r')
+                feat = np.array(feat)  # Copy to allow modification
+            else:
+                feat = np.load(feat_path)
             feat = torch.from_numpy(feat)
 
             # Apply augmentation if needed
