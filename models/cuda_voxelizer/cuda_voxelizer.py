@@ -10,12 +10,14 @@ Reference: https://github.com/huang-yh/GaussianFormer
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from pathlib import Path
+from torch import Tensor
 
 # Try to import compiled CUDA extension
 _cuda_ext = None
 _cuda_available = False
+_ops_registered = False
 
 
 def _get_cuda_ext():
@@ -30,6 +32,7 @@ def _get_cuda_ext():
         from . import voxelize_cuda_ext
         _cuda_ext = voxelize_cuda_ext
         _cuda_available = True
+        _register_custom_ops()
         return _cuda_ext
     except ImportError:
         pass
@@ -48,6 +51,7 @@ def _get_cuda_ext():
                 verbose=False,
             )
             _cuda_available = True
+            _register_custom_ops()
             print("[CUDAVoxelizer] CUDA extension compiled successfully")
             return _cuda_ext
     except Exception as e:
@@ -55,6 +59,75 @@ def _get_cuda_ext():
 
     _cuda_available = False
     return None
+
+
+def _register_custom_ops():
+    """Register voxelizer ops for torch.compile compatibility."""
+    global _ops_registered, _voxelizer_lib, _voxelizer_impl_lib
+    if _ops_registered:
+        return
+    _ops_registered = True
+
+    # Define the library for our custom ops (stored globally to prevent GC)
+    _voxelizer_lib = torch.library.Library("voxelizer", "DEF")
+
+    # Define op schema - note: List[int] for grid_shape, List[float] for vol_range
+    _voxelizer_lib.define(
+        "voxelize_gaussians(Tensor means3d, Tensor opacities, Tensor cov3D, Tensor radii, "
+        "Tensor features, int[] grid_shape, float[] vol_range, float voxel_size, float eps) -> (Tensor, Tensor)"
+    )
+
+    # Create implementation library (stored globally to prevent GC)
+    _voxelizer_impl_lib = torch.library.Library("voxelizer", "IMPL")
+
+    # Register CUDA implementation
+    def _voxelize_gaussians_cuda(
+        means3d: Tensor,
+        opacities: Tensor,
+        cov3D: Tensor,
+        radii: Tensor,
+        features: Tensor,
+        grid_shape: List[int],
+        vol_range: List[float],
+        voxel_size: float,
+        eps: float
+    ) -> Tuple[Tensor, Tensor]:
+        return _cuda_ext.voxelize_gaussians(
+            means3d, opacities, cov3D, radii, features,
+            grid_shape, vol_range, voxel_size, eps
+        )
+
+    _voxelizer_impl_lib.impl("voxelize_gaussians", _voxelize_gaussians_cuda, "CUDA")
+
+    # Register abstract (fake tensor) implementation for torch.compile tracing
+    @torch.library.register_fake("voxelizer::voxelize_gaussians")
+    def _voxelize_gaussians_fake(
+        means3d: Tensor,
+        opacities: Tensor,
+        cov3D: Tensor,
+        radii: Tensor,
+        features: Tensor,
+        grid_shape: List[int],
+        vol_range: List[float],
+        voxel_size: float,
+        eps: float
+    ) -> Tuple[Tensor, Tensor]:
+        # Output shapes: [X, Y, Z, 1] for density, [X, Y, Z, feat_dim] for features
+        X, Y, Z = grid_shape
+        feat_dim = features.shape[-1] if features.numel() > 0 else 0
+
+        grid_density = means3d.new_empty(X, Y, Z, 1)
+        if feat_dim > 0:
+            grid_feats = means3d.new_empty(X, Y, Z, feat_dim)
+        else:
+            grid_feats = means3d.new_empty(0, 0)
+
+        return grid_density, grid_feats
+
+
+# Global variables to store library objects and prevent garbage collection
+_voxelizer_lib = None
+_voxelizer_impl_lib = None
 
 
 def _filter_gaussians_torch(
@@ -193,8 +266,8 @@ class CUDAVoxelizer(nn.Module):
         CovInv = Cov.cpu().float().inverse().to(device=device, dtype=dtype)
 
         # Pack as 6 elements: [Λ_xx, Λ_yy, Λ_zz, Λ_xy, Λ_yz, Λ_xz]
-        # From flattened 3x3: indices [0, 4, 8, 1, 5, 2]
-        cov3D = CovInv.flatten(1)[:, [0, 4, 8, 1, 5, 2]]
+        indices = torch.tensor([0, 4, 8, 1, 5, 2], device=device, dtype=torch.long)
+        cov3D = CovInv.flatten(1).index_select(1, indices)
 
         # Compute radii: ceil(max_scale * sigma_factor / voxel_size)
         radii = torch.ceil(
@@ -240,14 +313,13 @@ class CUDAVoxelizer(nn.Module):
         else:
             features = torch.empty((0, 0), device=device, dtype=torch.float32)
 
-        # Get CUDA extension
+        # Ensure CUDA extension is loaded and ops registered
         if self._cuda_ext is None:
             self._cuda_ext = _get_cuda_ext()
 
         if self._cuda_ext is not None and means3d.is_cuda:
-            # Use CUDA kernel
             vol_range_list = self.vol_range.tolist()
-            grid_density, grid_feats = self._cuda_ext.voxelize_gaussians(
+            grid_density, grid_feats = torch.ops.voxelizer.voxelize_gaussians(
                 means3d,
                 opacities,
                 cov3D,

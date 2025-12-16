@@ -269,10 +269,8 @@ def get_covariance(s: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
     Returns:
         Covariance matrices of shape [B, N, 3, 3].
     """
-    L = torch.zeros((*s.shape[:2], 3, 3)).to(s)
-    for i in range(s.size(-1)):
-        L[..., i, i] = s[..., i]
-
+    # Use torch.diag_embed instead of loop for diagonal matrix creation
+    L = torch.diag_embed(s)  # [B, N, 3, 3] diagonal matrix
     L = r @ L
     covariance = L @ L.mT
     return covariance
@@ -344,10 +342,10 @@ def flatten_bsn_forward(func: Callable, *args, **kwargs):
     if isinstance(outs, tuple):
         outs = list(outs)
         for i, out in enumerate(outs):
-            outs[i] = out.reshape(bsn + out.shape[1:])
+            outs[i] = out.reshape(tuple(bsn) + tuple(out.shape[1:]))
         return tuple(outs)
     else:
-        outs = outs.reshape(bsn + outs.shape[1:])
+        outs = outs.reshape(tuple(bsn) + tuple(outs.shape[1:]))
     return outs
 
 

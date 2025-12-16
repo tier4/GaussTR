@@ -69,6 +69,9 @@ class GaussTRLightning(pl.LightningModule):
         # Data preprocessor config
         mean: List[float] = None,
         std: List[float] = None,
+        # Performance optimizations
+        torch_compile: bool = False,
+        compile_mode: str = "reduce-overhead",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -154,6 +157,30 @@ class GaussTRLightning(pl.LightningModule):
             GaussTRHead(**head_cfg) for _ in range(decoder_num_layers)
         ])
 
+        # Apply torch.compile() for performance optimization (PyTorch 2.0+)
+        if torch_compile and hasattr(torch, 'compile'):
+            print(f"Applying torch.compile() with mode='{compile_mode}' to neck and decoder")
+            self.neck = torch.compile(self.neck, mode=compile_mode)
+            self.decoder = torch.compile(self.decoder, mode=compile_mode)
+
+        # Fix DDP gradient stride mismatch for 1x1 convolutions
+        self._register_contiguous_grad_hooks()
+
+    def _register_contiguous_grad_hooks(self):
+        """Register hooks to make gradients contiguous for 1x1 convolutions.
+
+        This fixes the DDP warning about gradient strides not matching bucket view strides,
+        which occurs with 1x1 Conv2d layers where the gradient memory layout differs from
+        the expected contiguous layout.
+        """
+        def make_contiguous_hook(grad):
+            return grad.contiguous() if grad is not None and not grad.is_contiguous() else grad
+
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                if module.kernel_size == (1, 1) and module.weight.requires_grad:
+                    module.weight.register_hook(make_contiguous_hook)
+
     def forward(
         self,
         images: torch.Tensor,
@@ -162,7 +189,6 @@ class GaussTRLightning(pl.LightningModule):
         cam2img: torch.Tensor,
         cam2ego: torch.Tensor,
         img_aug_mat: Optional[torch.Tensor] = None,
-        _profile: bool = False,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """Forward pass for inference.
@@ -174,52 +200,28 @@ class GaussTRLightning(pl.LightningModule):
             cam2img: Camera intrinsics [B, N, 4, 4].
             cam2ego: Camera extrinsics [B, N, 4, 4].
             img_aug_mat: Image augmentation matrix [B, N, 4, 4]. Optional.
-            _profile: Enable detailed profiling.
 
         Returns:
             Occupancy predictions.
         """
-        import time
-
-        if _profile:
-            torch.cuda.synchronize()
-            t0 = time.time()
-
         bs, n = images.shape[:2]
 
         # Use pre-extracted features
         x = feats.flatten(0, 1)
 
         # Multi-scale features
-        if _profile:
-            torch.cuda.synchronize()
-            t1 = time.time()
         multi_scale_feats = self.neck(x)
-        if _profile:
-            torch.cuda.synchronize()
-            t2 = time.time()
-            print(f"    [Forward] Neck: {(t2-t1)*1000:.1f}ms")
 
         # Prepare decoder inputs
         decoder_inputs = self.pre_transformer(multi_scale_feats)
         feat_flatten = flatten_multi_scale_feats(multi_scale_feats)[0]
         decoder_inputs.update(self.pre_decoder(feat_flatten, bs))
 
-        if _profile:
-            torch.cuda.synchronize()
-            t3 = time.time()
-            print(f"    [Forward] Pre-decoder: {(t3-t2)*1000:.1f}ms")
-
         # Forward through decoder
         decoder_outputs = self.forward_decoder(
             reg_branches=[h.regress_head for h in self.gauss_heads],
             **decoder_inputs
         )
-
-        if _profile:
-            torch.cuda.synchronize()
-            t4 = time.time()
-            print(f"    [Forward] Decoder: {(t4-t3)*1000:.1f}ms")
 
         query = decoder_outputs['hidden_states']
         reference_points = decoder_outputs['references']
@@ -238,12 +240,6 @@ class GaussTRLightning(pl.LightningModule):
             mode='predict',
             **kwargs
         )
-
-        if _profile:
-            torch.cuda.synchronize()
-            t5 = time.time()
-            print(f"    [Forward] Head: {(t5-t4)*1000:.1f}ms")
-            print(f"    [Forward] TOTAL: {(t5-t0)*1000:.1f}ms")
 
         return result
 
@@ -323,6 +319,7 @@ class GaussTRLightning(pl.LightningModule):
 
         return total_loss
 
+    @torch.no_grad()
     def validation_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -385,6 +382,7 @@ class GaussTRLightning(pl.LightningModule):
                 print(self.val_occ_metric.get_table_str())
             self.val_occ_metric.reset()
 
+    @torch.no_grad()
     def test_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -399,31 +397,14 @@ class GaussTRLightning(pl.LightningModule):
         Returns:
             Dictionary with predictions.
         """
-        # Profiling - enable for first 5 batches on rank 0
-        _do_profile = batch_idx < 5 and self.global_rank == 0
-        if _do_profile:
-            import time
-            # Enable detailed profiling in head
-            self.gauss_heads[-1]._profile_enabled = True
-            torch.cuda.synchronize()
-            t0 = time.time()
-            print(f"\n=== Batch {batch_idx} Profiling ===")
-        else:
-            self.gauss_heads[-1]._profile_enabled = False
-
         preds = self.forward(
             images=batch['images'],
             feats=batch['feats'],
             depth=batch['depth'],
             cam2img=batch['cam2img'],
             cam2ego=batch['cam2ego'],
-            img_aug_mat=batch.get('img_aug_mat'),
-            _profile=_do_profile
+            img_aug_mat=batch.get('img_aug_mat')
         )
-
-        if _do_profile:
-            torch.cuda.synchronize()
-            t1 = time.time()
 
         # Update metric if ground truth available
         gt_occ = batch.get('gt_occ')
@@ -440,11 +421,6 @@ class GaussTRLightning(pl.LightningModule):
                 ).to(self.device)
 
             self.occ_metric.update(preds, gt_occ, mask)
-
-        if _do_profile:
-            torch.cuda.synchronize()
-            t2 = time.time()
-            print(f"[Batch {batch_idx}] Metric: {(t2-t1)*1000:.1f}ms, TOTAL: {(t2-t0)*1000:.1f}ms")
 
         return {'preds': preds}
 

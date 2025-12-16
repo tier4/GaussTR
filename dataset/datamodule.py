@@ -45,6 +45,7 @@ class GaussTRDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         persistent_workers: bool = True,
+        prefetch_factor: int = 3,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -61,6 +62,7 @@ class GaussTRDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
+        self.prefetch_factor = prefetch_factor if num_workers > 0 else None
 
         self.train_dataset = None
         self.val_dataset = None
@@ -134,6 +136,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             collate_fn=collate_gausstr,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
             drop_last=True,
         )
 
@@ -147,6 +150,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             collate_fn=collate_gausstr,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
             drop_last=False,
         )
 
@@ -161,6 +165,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             collate_fn=collate_gausstr,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
             drop_last=False,
         )
 
@@ -204,6 +209,7 @@ class GaussTRDataModuleFromConfig(GaussTRDataModule):
             sem_seg_root=data_cfg.sem_seg_root,
             batch_size=data_cfg.batch_size,
             num_workers=data_cfg.num_workers,
-            pin_memory=True,
-            persistent_workers=True,
+            pin_memory=getattr(data_cfg, 'pin_memory', True),
+            persistent_workers=getattr(data_cfg, 'persistent_workers', True),
+            prefetch_factor=getattr(data_cfg, 'prefetch_factor', 3),
         )

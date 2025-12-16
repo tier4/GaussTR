@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .utils import (
-    cam2world, get_covariance, rotmat_to_quat, flatten_bsn_forward,
+    cam2world, rotmat_to_quat, flatten_bsn_forward,
     OCC3D_CATEGORIES
 )
 from .gsplat_rasterization import rasterize_gaussians
@@ -83,9 +83,8 @@ def prompt_denoising(
     probs = logits.softmax(-1)
     probs_ = F.softmax(logits * logit_scale, -1)
     max_cls_conf = probs_.flatten(1, 3).max(1).values
-    selected_cls = (max_cls_conf < pd_threshold)[:, None, None,
-                                                 None].expand(*probs.shape)
-    probs[selected_cls] = 0
+    mask = (max_cls_conf < pd_threshold)[:, None, None, None]
+    probs = torch.where(mask, torch.zeros_like(probs), probs)
     return probs
 
 
@@ -188,6 +187,12 @@ class GaussTRHead(nn.Module):
             }
         self.voxelizer = CUDAVoxelizer(**voxelizer_cfg)
 
+        # Cache image shape tensor (avoids tensor creation every forward pass)
+        self.register_buffer(
+            'image_shape_tensor',
+            torch.tensor(image_shape[::-1], dtype=torch.float32)  # [W, H]
+        )
+
         # Loss
         self.silog_loss = SiLogLoss()
 
@@ -223,13 +228,13 @@ class GaussTRHead(nn.Module):
             If mode='tensor': Gaussian parameters.
         """
         bs, n = cam2img.shape[:2]
-        x = x.reshape(bs, n, *x.shape[1:])
+        x = x.reshape((bs, n) + tuple(x.shape[1:]))
 
         # Predict Gaussian position deltas
         deltas = self.regress_head(x)
         ref_pts = (
             deltas[..., :2] +
-            inverse_sigmoid(ref_pts.reshape(*x.shape[:-1], -1))).sigmoid()
+            inverse_sigmoid(ref_pts.reshape(tuple(x.shape[:-1]) + (-1,)))).sigmoid()
 
         # Sample depth at reference points
         # depth shape: [B, N, H, W] - same as original implementation
@@ -245,7 +250,7 @@ class GaussTRHead(nn.Module):
 
         # Compute 3D points from 2D reference points + depth
         points = torch.cat([
-            ref_pts * torch.tensor(self.image_shape[::-1]).to(x),
+            ref_pts * self.image_shape_tensor,
             sample_depth * (1 + deltas[..., 2:3])
         ], -1)
         means3d = cam2world(points, cam2img, cam2ego, img_aug_mat)
@@ -256,28 +261,14 @@ class GaussTRHead(nn.Module):
         scales = self.scale_head(x) * self.scale_transform(
             sample_depth, cam2img[..., 0, 0]).clamp(1e-6)
 
-        # Compute covariances
-        covariances = flatten_bsn_forward(
-            get_covariance, scales, cam2ego[..., None, :3, :3])
+        # Compute rotations from camera extrinsics
         rotations = flatten_bsn_forward(rotmat_to_quat, cam2ego[..., :3, :3])
         rotations = rotations.unsqueeze(2).expand(-1, -1, x.size(2), -1)
 
         # Inference mode: voxelize and predict occupancy
         if mode == 'predict':
-            import time
-            _profile = hasattr(self, '_profile_enabled') and self._profile_enabled
-
-            if _profile:
-                torch.cuda.synchronize()
-                t0 = time.time()
-
             if self.text_proto_embeds is not None:
                 features = features @ self.text_proto_embeds
-
-            if _profile:
-                torch.cuda.synchronize()
-                t1 = time.time()
-                print(f"  [Head] Text proj: {t1-t0:.3f}s")
 
             density, grid_feats = self.voxelizer(
                 means3d=means3d.flatten(1, 2),
@@ -285,11 +276,6 @@ class GaussTRHead(nn.Module):
                 features=features.flatten(1, 2).softmax(-1),
                 scales=scales.flatten(1, 2),
                 rotations=rotations.flatten(1, 2))
-
-            if _profile:
-                torch.cuda.synchronize()
-                t2 = time.time()
-                print(f"  [Head] Voxelizer: {t2-t1:.3f}s")
 
             if self.use_prompt_denoising:
                 probs = prompt_denoising(grid_feats)
@@ -300,11 +286,6 @@ class GaussTRHead(nn.Module):
             preds = probs.argmax(-1)
             preds += (preds > 10) * 1 + 1  # skip two classes of "others"
             preds = torch.where(density.squeeze(-1) > 4e-2, preds, 17)
-
-            if _profile:
-                torch.cuda.synchronize()
-                t3 = time.time()
-                print(f"  [Head] Post-proc: {t3-t2:.3f}s, Total: {t3-t0:.3f}s")
 
             return preds
 
@@ -395,4 +376,4 @@ class GaussTRHead(nn.Module):
         multiplier: float = 7.5
     ) -> torch.Tensor:
         """Transform scale based on depth and focal length."""
-        return depth * multiplier / focal.reshape(*depth.shape[:2], 1, 1)
+        return depth * multiplier / focal.reshape(tuple(depth.shape[:2]) + (1, 1))

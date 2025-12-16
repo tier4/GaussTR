@@ -8,7 +8,7 @@ from __future__ import absolute_import, division, print_function
 
 import math
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
+from torch import Tensor
 
 # Import the compiled CUDA module from local cuda_msda package
 try:
@@ -28,6 +29,94 @@ except ImportError:
         "Please build it from models/cuda_msda/"
     )
 
+# Global variables to store library objects and prevent garbage collection
+_msda_lib = None
+_msda_impl_lib = None
+
+# Register custom ops for torch.compile compatibility
+if HAS_CUDA_MSDA:
+    # Define the library for our custom ops (stored globally to prevent GC)
+    _msda_lib = torch.library.Library("msda", "DEF")
+
+    # Define op schemas
+    _msda_lib.define(
+        "ms_deform_attn_forward(Tensor value, Tensor spatial_shapes, Tensor level_start_index, "
+        "Tensor sampling_locations, Tensor attention_weights, int im2col_step) -> Tensor"
+    )
+    _msda_lib.define(
+        "ms_deform_attn_backward(Tensor value, Tensor spatial_shapes, Tensor level_start_index, "
+        "Tensor sampling_locations, Tensor attention_weights, Tensor grad_output, int im2col_step) "
+        "-> (Tensor, Tensor, Tensor)"
+    )
+
+    # Create implementation library (stored globally to prevent GC)
+    _msda_impl_lib = torch.library.Library("msda", "IMPL")
+
+    # Register CUDA implementations
+    def _ms_deform_attn_forward_cuda(
+        value: Tensor,
+        spatial_shapes: Tensor,
+        level_start_index: Tensor,
+        sampling_locations: Tensor,
+        attention_weights: Tensor,
+        im2col_step: int
+    ) -> Tensor:
+        return MSDA.ms_deform_attn_forward(
+            value, spatial_shapes, level_start_index,
+            sampling_locations, attention_weights, im2col_step
+        )
+
+    def _ms_deform_attn_backward_cuda(
+        value: Tensor,
+        spatial_shapes: Tensor,
+        level_start_index: Tensor,
+        sampling_locations: Tensor,
+        attention_weights: Tensor,
+        grad_output: Tensor,
+        im2col_step: int
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        return tuple(MSDA.ms_deform_attn_backward(
+            value, spatial_shapes, level_start_index,
+            sampling_locations, attention_weights, grad_output, im2col_step
+        ))
+
+    _msda_impl_lib.impl("ms_deform_attn_forward", _ms_deform_attn_forward_cuda, "CUDA")
+    _msda_impl_lib.impl("ms_deform_attn_backward", _ms_deform_attn_backward_cuda, "CUDA")
+
+    # Register abstract (fake tensor) implementations for torch.compile tracing
+    @torch.library.register_fake("msda::ms_deform_attn_forward")
+    def _ms_deform_attn_forward_fake(
+        value: Tensor,
+        spatial_shapes: Tensor,
+        level_start_index: Tensor,
+        sampling_locations: Tensor,
+        attention_weights: Tensor,
+        im2col_step: int
+    ) -> Tensor:
+        # value: [batch, spatial_size, num_heads, channels]
+        # sampling_locations: [batch, num_query, num_heads, num_levels, num_points, 2]
+        # output: [batch, num_query, num_heads * channels]
+        batch = value.shape[0]
+        num_heads = value.shape[2]
+        channels = value.shape[3]
+        num_query = sampling_locations.shape[1]
+        return value.new_empty(batch, num_query, num_heads * channels)
+
+    @torch.library.register_fake("msda::ms_deform_attn_backward")
+    def _ms_deform_attn_backward_fake(
+        value: Tensor,
+        spatial_shapes: Tensor,
+        level_start_index: Tensor,
+        sampling_locations: Tensor,
+        attention_weights: Tensor,
+        grad_output: Tensor,
+        im2col_step: int
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        grad_value = torch.empty_like(value)
+        grad_sampling_loc = torch.empty_like(sampling_locations)
+        grad_attn_weight = torch.empty_like(attention_weights)
+        return grad_value, grad_sampling_loc, grad_attn_weight
+
 
 def _is_power_of_2(n: int) -> bool:
     """Check if n is a power of 2."""
@@ -37,7 +126,11 @@ def _is_power_of_2(n: int) -> bool:
 
 
 class MSDeformAttnFunction(Function):
-    """Autograd function for multi-scale deformable attention."""
+    """Autograd function for multi-scale deformable attention.
+
+    Uses registered custom ops (msda::ms_deform_attn_forward/backward) for
+    torch.compile compatibility.
+    """
 
     @staticmethod
     def forward(ctx, value, value_spatial_shapes, value_level_start_index,
@@ -52,9 +145,9 @@ class MSDeformAttnFunction(Function):
             sampling_locations = sampling_locations.float()
             attention_weights = attention_weights.float()
 
-        output = MSDA.ms_deform_attn_forward(
+        output = torch.ops.msda.ms_deform_attn_forward(
             value, value_spatial_shapes, value_level_start_index,
-            sampling_locations, attention_weights, ctx.im2col_step)
+            sampling_locations, attention_weights, im2col_step)
         ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index,
                               sampling_locations, attention_weights)
 
@@ -76,7 +169,7 @@ class MSDeformAttnFunction(Function):
             grad_output = grad_output.float()
 
         grad_value, grad_sampling_loc, grad_attn_weight = \
-            MSDA.ms_deform_attn_backward(
+            torch.ops.msda.ms_deform_attn_backward(
                 value, value_spatial_shapes, value_level_start_index,
                 sampling_locations, attention_weights, grad_output, ctx.im2col_step)
 

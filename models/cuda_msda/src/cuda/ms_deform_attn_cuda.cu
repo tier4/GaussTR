@@ -13,6 +13,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -36,6 +37,9 @@ at::Tensor ms_deform_attn_cuda_forward(
     AT_ASSERTM(level_start_index.is_cuda(), "level_start_index must be a CUDA tensor");
     AT_ASSERTM(sampling_loc.is_cuda(), "sampling_loc must be a CUDA tensor");
     AT_ASSERTM(attn_weight.is_cuda(), "attn_weight must be a CUDA tensor");
+
+    // Set CUDA device guard for multi-GPU support
+    const at::cuda::CUDAGuard device_guard(value.device());
 
     const int batch = value.size(0);
     const int spatial_size = value.size(1);
@@ -103,6 +107,9 @@ std::vector<at::Tensor> ms_deform_attn_cuda_backward(
     AT_ASSERTM(sampling_loc.is_cuda(), "sampling_loc must be a CUDA tensor");
     AT_ASSERTM(attn_weight.is_cuda(), "attn_weight must be a CUDA tensor");
     AT_ASSERTM(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
+
+    // Set CUDA device guard for multi-GPU support
+    const at::cuda::CUDAGuard device_guard(value.device());
 
     const int batch = value.size(0);
     const int spatial_size = value.size(1);

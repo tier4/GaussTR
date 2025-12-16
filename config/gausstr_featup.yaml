@@ -74,6 +74,10 @@ model:
   mean: [123.675, 116.28, 103.53]
   std: [58.395, 57.12, 57.375]
 
+  # Performance optimizations
+  torch_compile: true  # Enable torch.compile() for 15-30% speedup (requires PyTorch 2.0+)
+  compile_mode: "max-autotune"  # Options: "default", "reduce-overhead", "max-autotune"
+
 # Data configuration
 data:
   data_root: "/mnt/nvme0/data/nuscenes"
@@ -88,6 +92,7 @@ data:
   num_workers: 4  # bs=4: 8
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 3  # Prefetch batches per worker for faster data loading
 
 # Trainer configuration
 trainer:

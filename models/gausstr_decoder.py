@@ -176,7 +176,6 @@ class MultiheadAttention(nn.Module):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_heads = num_heads
-        self.head_dims = embed_dims // num_heads
 
         self.attn = nn.MultiheadAttention(
             embed_dims,

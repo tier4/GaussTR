@@ -20,27 +20,30 @@
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
-#include <cooperative_groups.h>
 #include <vector>
 #include <cmath>
 
-namespace cg = cooperative_groups;
-
 #define THREADS_PER_BLOCK 256
 
+// Standard CUDA thread indexing (replaces cg::this_grid().thread_rank() which requires cooperative launch)
+#define GLOBAL_THREAD_IDX (blockIdx.x * blockDim.x + threadIdx.x)
+
 // Helper: get bounding box of voxels touched by a Gaussian
-__device__ void getRect(
+// Following GaussianFormer: clamp BOTH min and max to [0, grid] to avoid
+// negative differences that cause count mismatch between preprocess and duplicate
+__forceinline__ __device__ void getRect(
     int mean_x, int mean_y, int mean_z,
     int radius,
     int grid_x, int grid_y, int grid_z,
-    int3& rect_min, int3& rect_max
+    uint3& rect_min, uint3& rect_max  // Use uint3 like GaussianFormer
 ) {
-    rect_min.x = max(0, mean_x - radius);
-    rect_min.y = max(0, mean_y - radius);
-    rect_min.z = max(0, mean_z - radius);
-    rect_max.x = min(grid_x, mean_x + radius + 1);
-    rect_max.y = min(grid_y, mean_y + radius + 1);
-    rect_max.z = min(grid_z, mean_z + radius + 1);
+    // Clamp to [0, grid] for both min and max
+    rect_min.x = min((uint32_t)grid_x, (uint32_t)max(0, mean_x - radius));
+    rect_min.y = min((uint32_t)grid_y, (uint32_t)max(0, mean_y - radius));
+    rect_min.z = min((uint32_t)grid_z, (uint32_t)max(0, mean_z - radius));
+    rect_max.x = min((uint32_t)grid_x, (uint32_t)max(0, mean_x + radius + 1));
+    rect_max.y = min((uint32_t)grid_y, (uint32_t)max(0, mean_y + radius + 1));
+    rect_max.z = min((uint32_t)grid_z, (uint32_t)max(0, mean_z + radius + 1));
 }
 
 // Kernel 1: Count voxels touched by each Gaussian
@@ -51,7 +54,7 @@ __global__ void preprocessKernel(
     int grid_x, int grid_y, int grid_z,
     uint32_t* __restrict__ tiles_touched   // [P] - output: count of voxels touched
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= P) return;
 
     tiles_touched[idx] = 0;
@@ -61,10 +64,11 @@ __global__ void preprocessKernel(
     int mean_z = means3d_int[idx * 3 + 2];
     int radius = radii[idx];
 
-    int3 rect_min, rect_max;
+    uint3 rect_min, rect_max;
     getRect(mean_x, mean_y, mean_z, radius, grid_x, grid_y, grid_z, rect_min, rect_max);
 
-    int count = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) * (rect_max.z - rect_min.z);
+    // With uint3 and proper clamping, differences are always >= 0
+    uint32_t count = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) * (rect_max.z - rect_min.z);
     if (count > 0) {
         tiles_touched[idx] = count;
     }
@@ -80,7 +84,7 @@ __global__ void duplicateWithKeysKernel(
     uint32_t* __restrict__ keys_unsorted,   // Output: voxel keys
     uint32_t* __restrict__ values_unsorted  // Output: Gaussian indices
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= P) return;
 
     uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
@@ -90,12 +94,13 @@ __global__ void duplicateWithKeysKernel(
     int mean_z = means3d_int[idx * 3 + 2];
     int radius = radii[idx];
 
-    int3 rect_min, rect_max;
+    uint3 rect_min, rect_max;
     getRect(mean_x, mean_y, mean_z, radius, grid_x, grid_y, grid_z, rect_min, rect_max);
 
-    for (int x = rect_min.x; x < rect_max.x; x++) {
-        for (int y = rect_min.y; y < rect_max.y; y++) {
-            for (int z = rect_min.z; z < rect_max.z; z++) {
+    // With uint3 and proper clamping in getRect, all values are in [0, grid)
+    for (uint32_t x = rect_min.x; x < rect_max.x; x++) {
+        for (uint32_t y = rect_min.y; y < rect_max.y; y++) {
+            for (uint32_t z = rect_min.z; z < rect_max.z; z++) {
                 uint32_t key = x * grid_y * grid_z + y * grid_z + z;
                 keys_unsorted[off] = key;
                 values_unsorted[off] = idx;
@@ -111,7 +116,7 @@ __global__ void identifyRangesKernel(
     const uint32_t* __restrict__ sorted_keys,
     uint2* __restrict__ ranges  // [num_voxels] - output: (start, end) for each voxel
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= L) return;
 
     uint32_t curr_voxel = sorted_keys[idx];
@@ -144,7 +149,7 @@ __global__ void renderKernel(
     float* __restrict__ out_density,           // [num_voxels]
     float* __restrict__ out_features           // [num_voxels, FEAT_DIM] or nullptr
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= num_voxels) return;
 
     // Load voxel center
@@ -226,7 +231,7 @@ __global__ void renderKernelGeneric(
     float* __restrict__ out_density,
     float* __restrict__ out_features
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= num_voxels) return;
 
     float vx = voxel_centers[idx * 3 + 0];
@@ -292,7 +297,7 @@ __global__ void normalizeKernel(
     float* __restrict__ features,
     float eps
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= num_voxels) return;
 
     float d = density[idx];
@@ -312,7 +317,7 @@ __global__ void normalizeKernelGeneric(
     float* __restrict__ features,
     float eps
 ) {
-    auto idx = cg::this_grid().thread_rank();
+    auto idx = GLOBAL_THREAD_IDX;
     if (idx >= num_voxels) return;
 
     float d = density[idx];
@@ -530,6 +535,31 @@ std::vector<torch::Tensor> voxelize_gaussians_cuda(
     } else if (feat_dim > 0) {
         // Generic kernel with shared memory for features
         size_t shared_mem = THREADS_PER_BLOCK * feat_dim * sizeof(float);
+
+        // Check device shared memory limit
+        cudaDeviceProp prop;
+        int device_id;
+        cudaGetDevice(&device_id);
+        cudaGetDeviceProperties(&prop, device_id);
+
+        if (shared_mem > prop.sharedMemPerBlockOptin) {
+            AT_ERROR("Feature dimension too large for shared memory. "
+                     "Requested: ", shared_mem, " bytes, Max: ", prop.sharedMemPerBlockOptin, " bytes. "
+                     "Consider using feat_dim=128, 256, or 512 for template optimization.");
+        }
+
+        // Request extended shared memory if needed (>48KB)
+        if (shared_mem > 48 * 1024) {
+            cudaError_t err = cudaFuncSetAttribute(
+                renderKernelGeneric,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shared_mem
+            );
+            if (err != cudaSuccess) {
+                AT_ERROR("Failed to set shared memory attribute: ", cudaGetErrorString(err));
+            }
+        }
+
         renderKernelGeneric<<<render_blocks, THREADS_PER_BLOCK, shared_mem, stream>>>(
             num_voxels,
             feat_dim,

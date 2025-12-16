@@ -1,15 +1,16 @@
 """Data transforms for GaussTR Lightning.
 
 Pure PyTorch implementations without MMEngine/MMCV dependencies.
+Uses OpenCV for faster image operations instead of PIL.
 """
 
 import os
 from typing import Dict, List, Tuple, Optional, Any, Callable
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 
 
 class Compose:
@@ -60,8 +61,9 @@ class LoadMultiViewImages:
             img_path = cam_item['img_path']
             filenames.append(img_path)
 
-            # Load image
-            img = np.array(Image.open(img_path).convert('RGB'))
+            # Load image with OpenCV (faster than PIL)
+            img = cv2.imread(img_path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # OpenCV loads as BGR
             imgs.append(img)
 
             # Camera intrinsics (3x3 -> 4x4)
@@ -164,15 +166,26 @@ class ImageAug3D:
         flip: bool,
         rotate: float
     ) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
-        """Apply transform to image and update transformation matrix."""
-        # Convert to PIL
-        img = Image.fromarray(img.astype('uint8'), mode='RGB')
-        img = img.resize(resize_dims)
-        img = img.crop(crop)
+        """Apply transform to image and update transformation matrix using OpenCV."""
+        # Resize using OpenCV (much faster than PIL)
+        img = img.astype(np.uint8)
+        img = cv2.resize(img, resize_dims, interpolation=cv2.INTER_LINEAR)
 
+        # Crop using array slicing
+        x1, y1, x2, y2 = crop
+        img = img[y1:y2, x1:x2]
+
+        # Flip using OpenCV
         if flip:
-            img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
-        img = img.rotate(rotate)
+            img = cv2.flip(img, 1)  # 1 = horizontal flip
+
+        # Rotate using OpenCV warpAffine (10x faster than PIL rotate)
+        if rotate != 0:
+            h, w = img.shape[:2]
+            center = (w / 2, h / 2)
+            M = cv2.getRotationMatrix2D(center, rotate, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
         # Update transformation matrix
         rotation = rotation * resize
@@ -194,7 +207,7 @@ class ImageAug3D:
         rotation = A @ rotation
         translation = A @ translation + b
 
-        return np.array(img), rotation, translation
+        return img, rotation, translation
 
     def __call__(self, data: Dict) -> Dict:
         """Apply augmentation to all views."""
@@ -202,8 +215,10 @@ class ImageAug3D:
         new_imgs = []
         transforms = []
 
+        # Sample augmentation parameters ONCE for all views (not per-view)
+        resize, resize_dims, crop, flip, rotate = self.sample_augmentation(data)
+
         for img in imgs:
-            resize, resize_dims, crop, flip, rotate = self.sample_augmentation(data)
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
 
