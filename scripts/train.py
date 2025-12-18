@@ -13,9 +13,45 @@ With Hydra overrides:
         trainer.precision="16-mixed"
 """
 
+# === NUMA Binding Setup (MUST be before any heavy imports) ===
+# Binds each rank to its NUMA node for optimal memory locality on multi-socket systems
+import os
+import ctypes as _ctypes
+
+def _bind_numa():
+    """Bind process to NUMA node based on LOCAL_RANK.
+
+    Typical H100 HGX/DGX topology:
+    - NUMA 0: GPUs 0-3 (LOCAL_RANK 0-3)
+    - NUMA 1: GPUs 4-7 (LOCAL_RANK 4-7)
+
+    Environment variables:
+    - GPUS_PER_NUMA: GPUs per NUMA node (default: 4)
+    - DISABLE_NUMA_BINDING: Set to "1" to disable
+    """
+    if os.environ.get('DISABLE_NUMA_BINDING', '0') == '1':
+        return
+
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    gpus_per_numa = int(os.environ.get('GPUS_PER_NUMA', 4))
+    numa_node = local_rank // gpus_per_numa
+
+    try:
+        libnuma = _ctypes.CDLL('libnuma.so.1')
+        # Bind CPU execution to NUMA node
+        libnuma.numa_run_on_node(numa_node)
+        # Prefer memory allocation from this NUMA node
+        libnuma.numa_set_preferred(numa_node)
+        print(f"[RANK {local_rank}] Bound to NUMA node {numa_node}")
+    except OSError:
+        pass  # libnuma not available (non-NUMA system or missing library)
+
+_bind_numa()
+del _bind_numa, _ctypes
+# === End NUMA Binding Setup ===
+
 # === CUDA Toolkit Setup (MUST be before any imports that use CUDA) ===
 # This ensures gsplat can find nvcc in subprocess workers
-import os
 import glob as _glob
 
 def _setup_cuda():
