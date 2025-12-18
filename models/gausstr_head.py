@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 from .utils import (
     cam2world, rotmat_to_quat, flatten_bsn_forward,
@@ -199,6 +200,11 @@ class GaussTRHead(nn.Module):
         # Loss
         self.silog_loss = SiLogLoss()
 
+        # EMA for PCA - 10% weight for new updates
+        self.pca_ema_momentum = 0.1
+        self.register_buffer('pca_v', torch.zeros(feat_dims, reduce_dims))
+        self.register_buffer('pca_initialized', torch.tensor(0, dtype=torch.long))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -294,15 +300,36 @@ class GaussTRHead(nn.Module):
             return preds
 
         # Training mode: render and compute losses
-        tgt_feats = feats.flatten(-2).mT
+        tgt_feats = feats.flatten(-2).mT.float()  # [B*N, H*W, C]
 
-        # PCA for dimensionality reduction (GPU, FP32)
-        # Disable autocast - pca_lowrank doesn't support FP16
+        # PCA for dimensionality reduction (GPU, FP32) with EMA smoothing
         with torch.amp.autocast('cuda', enabled=False):
             u, s, v = torch.pca_lowrank(
-                tgt_feats.flatten(0, 2).float(), q=self.reduce_dims, niter=4)
-        tgt_feats = tgt_feats.float() @ v
-        features = features.float() @ v
+                tgt_feats.flatten(0, 2), q=self.reduce_dims, niter=4)
+
+            # EMA update for PCA to stabilize training
+            if self.training:
+                if self.pca_initialized.item() == 0:
+                    self.pca_v.copy_(v)
+                    self.pca_initialized.fill_(1)
+                else:
+                    # Align signs to handle PCA sign ambiguity
+                    sign = torch.sign((self.pca_v * v).sum(dim=0, keepdim=True))
+                    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                    v_aligned = v * sign
+                    # EMA: 90% old + 10% new
+                    self.pca_v.mul_(1 - self.pca_ema_momentum).add_(
+                        v_aligned * self.pca_ema_momentum)
+
+                # Sync pca_v across GPUs in distributed training to prevent divergence
+                if dist.is_initialized():
+                    dist.all_reduce(self.pca_v, op=dist.ReduceOp.AVG)
+
+            # Project features using EMA-smoothed PCA
+            v = self.pca_v
+
+        tgt_feats = tgt_feats @ v
+        features = features @ v
 
         # Render Gaussians
         rendered = rasterize_gaussians(
