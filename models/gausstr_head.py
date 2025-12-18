@@ -132,7 +132,8 @@ class GaussTRHead(nn.Module):
         embed_dims: Input embedding dimensions.
         feat_dims: Feature dimensions for Gaussian features.
         reduce_dims: Reduced dimensions for PCA.
-        image_shape: Input image shape (height, width).
+        image_shape: Input image shape (height, width) for features.
+        render_image_size: Original image size (height, width) for Gaussian rasterization.
         patch_size: Patch size used for feature extraction.
         depth_limit: Maximum depth limit.
         text_protos: Path to text prototype embeddings. Optional.
@@ -147,6 +148,7 @@ class GaussTRHead(nn.Module):
         feat_dims: int = 512,
         reduce_dims: int = 128,
         image_shape: Tuple[int, int] = (432, 768),
+        render_image_size: Tuple[int, int] = (900, 1600),
         patch_size: int = 16,
         depth_limit: float = 51.2,
         text_protos: Optional[str] = None,
@@ -158,6 +160,7 @@ class GaussTRHead(nn.Module):
 
         self.reduce_dims = reduce_dims
         self.image_shape = image_shape
+        self.render_image_size = render_image_size
         self.patch_size = patch_size
         self.depth_limit = depth_limit
         self.use_prompt_denoising = prompt_denoising
@@ -311,7 +314,7 @@ class GaussTRHead(nn.Module):
             cam2img,
             cam2ego,
             img_aug_mats=img_aug_mat,
-            image_size=(900, 1600),
+            image_size=self.render_image_size,
             near_plane=0.1,
             far_plane=100,
             render_mode='RGB+D',

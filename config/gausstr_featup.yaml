@@ -46,6 +46,7 @@ model:
   # Head config
   head_reduce_dims: 128
   head_image_shape: [432, 768]
+  head_render_image_size: [900, 1600]  # Original nuScenes image resolution for rasterization
   head_patch_size: 16
   head_depth_limit: 51.2
   head_text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"
