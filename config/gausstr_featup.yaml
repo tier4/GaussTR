@@ -29,10 +29,10 @@ test_after_training: true
 model:
   num_queries: 300
   embed_dims: 256
-  feat_dims: 512
+  feat_dims: 768
 
   # Neck config
-  neck_in_channels: 512
+  neck_in_channels: 768
   neck_out_channels: 256
   neck_norm_type: "LN2d"
 
@@ -48,7 +48,7 @@ model:
   head_image_shape: [432, 768]
   head_patch_size: 16
   head_depth_limit: 51.2
-  head_text_protos: "ckpts/text_proto_embeds_clip.pth"
+  head_text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"
   head_prompt_denoising: true
   head_num_segment_classes: 18
 
@@ -60,10 +60,9 @@ model:
   sigma_factor: 3.0  # Gaussian radius multiplier for voxelization
 
   # Training config (passed to LightningModule)
-  # Note: values below are for batch_size=2. For bs=4: lr=0.0004, warmup_iters=100
-  learning_rate: 0.0002  # bs=4: 0.0004 (linear scaling)
+  learning_rate: 0.0004  # Linear scaling: lr * (bs/2)
   weight_decay: 0.005
-  warmup_iters: 200  # bs=4: 100 (halved when bs doubles)
+  warmup_iters: 100  # Halved when batch size doubles
   warmup_factor: 0.001
   lr_milestones: [16]
   lr_gamma: 0.1
@@ -85,11 +84,11 @@ data:
   val_ann_file: "data/nuscenes/nuscenes_infos_val.pkl"
   input_size: [432, 768]
   resize_lim: [0.48, 0.48]
-  depth_root: "data/nuscenes_metric3d"
-  feats_root: "data/nuscenes_featup"
-  sem_seg_root: "data/nuscenes_grounded_sam2"
-  batch_size: 2  # bs=4: num_workers=8, lr=0.0004, warmup_iters=100
-  num_workers: 4  # bs=4: 8
+  depth_root: "data/nuscenes_unidepth"
+  feats_root: "data/nuscenes_dinov3clip"
+  sem_seg_root: null  # Set to "data/nuscenes_sam3" to enable segmentation
+  batch_size: 4
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 3  # Prefetch batches per worker for faster data loading
@@ -99,7 +98,7 @@ trainer:
   max_epochs: 24
   accelerator: "gpu"
   devices: 8
-  strategy: "ddp"
+  strategy: "ddp_find_unused_parameters_true"
   precision: "16-mixed"
   gradient_clip_val: 35.0
   gradient_clip_algorithm: "norm"
