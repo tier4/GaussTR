@@ -74,8 +74,9 @@ def draw_bev_occupancy(
     occupancy: np.ndarray,
     output_size: Tuple[int, int] = (800, 800),
     free_class: int = 17,
-    rotate_deg: float = -90,
+    rotate_deg: float = 90,
     flip_horizontal: bool = False,
+    flip_vertical: bool = False,
     colors: Optional[np.ndarray] = None,
     draw_grid: bool = False,
     draw_ego: bool = True,
@@ -88,7 +89,8 @@ def draw_bev_occupancy(
         output_size: Output image size (height, width).
         free_class: Class ID for 'free' voxels.
         rotate_deg: Rotation angle in degrees.
-        flip_horizontal: Whether to flip horizontally.
+        flip_horizontal: Whether to flip horizontally (left-right).
+        flip_vertical: Whether to flip vertically (up-down).
         colors: Custom color array.
         draw_grid: Whether to draw grid lines.
         draw_ego: Whether to draw ego vehicle marker.
@@ -96,6 +98,7 @@ def draw_bev_occupancy(
 
     Returns:
         BEV visualization image (H, W, 3) in BGR format.
+        Default orientation: forward=up, left=left (ego vehicle facing up).
     """
     # Convert to BEV
     bev = occ_to_bev(occupancy, free_class=free_class)
@@ -110,6 +113,8 @@ def draw_bev_occupancy(
     # Flip
     if flip_horizontal:
         colored = np.flip(colored, axis=1).copy()
+    if flip_vertical:
+        colored = np.flip(colored, axis=0).copy()
 
     # Resize to output size
     colored = cv2.resize(colored, output_size, interpolation=cv2.INTER_NEAREST)
