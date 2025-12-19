@@ -4,15 +4,24 @@ Visualization tools for 3D occupancy predictions from GaussTR.
 
 ## Installation
 
-The visualization module requires additional dependencies beyond the core GaussTR requirements:
+The visualization module requires additional dependencies. Install using the optional dependency groups:
 
 ```bash
 # Using uv (recommended)
-uv pip install opencv-python scipy matplotlib
+uv pip install -e ".[visualization]"
 
-# Optional: Open3D for high-quality 3D rendering (slower than PyTorch GPU)
-uv pip install open3d
+# With Open3D for high-quality 3D rendering (optional, slower than PyTorch GPU)
+uv pip install -e ".[visualization-3d]"
+
+# Or install dependencies directly
+uv pip install scipy matplotlib
+uv pip install open3d  # optional
 ```
+
+**Dependencies:**
+- `scipy` - BEV rotation transforms
+- `matplotlib` - Fallback 3D rendering (when CUDA unavailable)
+- `open3d` - Optional high-quality 3D rendering (interactive visualization)
 
 ## Two Visualization Workflows
 

@@ -56,6 +56,15 @@ tensorboard = [
 wandb = [
     "wandb>=0.13.0",
 ]
+visualization = [
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+]
+visualization-3d = [
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+    "open3d>=0.17.0",
+]
 
 [dependency-groups]
 dev = [
