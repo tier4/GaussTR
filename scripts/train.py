@@ -246,6 +246,20 @@ def build_callbacks(cfg: DictConfig, checkpoint_dir: str, log_artifacts: bool = 
     if log_artifacts:
         callbacks.append(MLflowArtifactCallback(cfg, checkpoint_dir))
 
+    # Visualization callback (optional) - runs after test
+    vis_cfg = cfg.get('visualization', {})
+    if vis_cfg.get('enabled', False):
+        from visualization import VisualizationCallback
+        vis_callback = VisualizationCallback(
+            num_samples=vis_cfg.get('num_samples', 50),
+            mode=vis_cfg.get('mode', 'composite'),
+            output_format=vis_cfg.get('output_format', 'image'),
+            fps=vis_cfg.get('fps', 10),
+            save_predictions=vis_cfg.get('save_predictions', False),
+            output_dir=os.path.join(checkpoint_dir, 'visualizations'),
+        )
+        callbacks.append(vis_callback)
+
     return callbacks
 
 

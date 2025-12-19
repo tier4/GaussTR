@@ -347,7 +347,7 @@ class PackInputs:
         self.keys = keys or ['img']
         self.meta_keys = meta_keys or [
             'cam2img', 'cam2ego', 'ego2global', 'img_aug_mat',
-            'sample_idx', 'num_views', 'img_path', 'depth', 'feats', 'sem_seg'
+            'sample_idx', 'token', 'timestamp', 'num_views', 'img_path', 'depth', 'feats', 'sem_seg'
         ]
 
     def __call__(self, results: Dict) -> Dict:

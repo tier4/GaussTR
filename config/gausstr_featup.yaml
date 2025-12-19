@@ -115,3 +115,12 @@ trainer:
 # Optional: checkpoint to resume from
 # resume_from: null
 # load_from: null
+
+# Visualization configuration (optional - generates visualizations after test)
+visualization:
+  enabled: false  # Set to true to enable visualization after test
+  num_samples: -1  # Number of samples to visualize (-1 for all)
+  mode: composite  # Options: bev, composite, full
+  output_format: image  # Options: image, video
+  fps: 10  # Video FPS (if output_format=video)
+  save_predictions: false  # Save raw prediction .npz files
