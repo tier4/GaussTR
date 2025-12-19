@@ -46,6 +46,7 @@ class GaussTRLightning(pl.LightningModule):
         # Head config
         head_reduce_dims: int = 128,
         head_image_shape: Tuple[int, int] = (432, 768),
+        head_render_image_size: Tuple[int, int] = (900, 1600),
         head_patch_size: int = 16,
         head_depth_limit: float = 51.2,
         head_text_protos: Optional[str] = "ckpts/text_proto_embeds_clip.pth",
@@ -140,6 +141,7 @@ class GaussTRLightning(pl.LightningModule):
             'feat_dims': feat_dims,
             'reduce_dims': head_reduce_dims,
             'image_shape': head_image_shape,
+            'render_image_size': head_render_image_size,
             'patch_size': head_patch_size,
             'depth_limit': head_depth_limit,
             'text_protos': head_text_protos,

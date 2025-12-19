@@ -82,6 +82,7 @@ class GaussHeadConfig:
     feat_dims: int = 512
     reduce_dims: int = 128
     image_shape: Tuple[int, int] = (432, 768)
+    render_image_size: Tuple[int, int] = (900, 1600)
     patch_size: int = 16
     depth_limit: float = 51.2
     text_protos: Optional[str] = "ckpts/text_proto_embeds_clip.pth"
