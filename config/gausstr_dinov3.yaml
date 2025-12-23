@@ -49,9 +49,15 @@ model:
   head_render_image_size: [900, 1600]  # Original nuScenes image resolution for rasterization
   head_patch_size: 16
   head_depth_limit: 51.2
-  head_text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"
+  head_text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"  # 21-class for inference
+  head_text_protos_sam3: "ckpts/text_proto_embeds_dinov3clip_sam3.pth"  # 17-class for SAM3 training
   head_prompt_denoising: true
   head_num_segment_classes: 18
+
+  # Text-guided loss config
+  head_text_loss_weight: 3.0  # Weight for text contrastive loss
+  head_text_loss_temp: 0.5  # Temperature for contrastive loss (0.5 = scale by 2x)
+  head_cosine_loss_weight: 2.0  # Weight for visual feature cosine loss (reduced from 5.0)
 
   # Voxelizer config (defaults match original GaussTR)
   vol_range: [-40, -40, -1, 40, 40, 5.4]
@@ -61,7 +67,7 @@ model:
   sigma_factor: 3.0  # Gaussian radius multiplier for voxelization
 
   # Training config (passed to LightningModule)
-  learning_rate: 0.0004  # Linear scaling: lr * (bs/2)
+  learning_rate: 0.0008  # Linear scaling: lr * (bs/2), doubled for bs=4
   weight_decay: 0.005
   warmup_iters: 100  # Halved when batch size doubles
   warmup_factor: 0.001
@@ -87,12 +93,12 @@ data:
   resize_lim: [0.48, 0.48]
   depth_root: "data/nuscenes_unidepth"
   feats_root: "data/nuscenes_dinov3clip"
-  sem_seg_root: null  # Set to "data/nuscenes_sam3" to enable segmentation
+  sem_seg_root: "data/nuscenes_sam3"  # SAM3 segmentation for text-guided training
   batch_size: 4
   num_workers: 8
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 3  # Prefetch batches per worker for faster data loading
+  prefetch_factor: 4  # Prefetch batches per worker for faster data loading
 
 # Trainer configuration
 trainer:
@@ -100,7 +106,7 @@ trainer:
   accelerator: "gpu"
   devices: 8
   strategy: "ddp_find_unused_parameters_true"
-  precision: "16-mixed"
+  precision: "bf16-mixed"
   gradient_clip_val: 35.0
   gradient_clip_algorithm: "norm"
   accumulate_grad_batches: 1

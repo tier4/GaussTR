@@ -50,8 +50,12 @@ class GaussTRLightning(pl.LightningModule):
         head_patch_size: int = 16,
         head_depth_limit: float = 51.2,
         head_text_protos: Optional[str] = "ckpts/text_proto_embeds_clip.pth",
+        head_text_protos_sam3: Optional[str] = None,  # SAM3-aligned text embeddings for training
         head_prompt_denoising: bool = True,
         head_num_segment_classes: int = 17,
+        head_text_loss_weight: float = 3.0,  # Weight for text contrastive loss
+        head_text_loss_temp: float = 0.1,  # Temperature for text contrastive loss
+        head_cosine_loss_weight: float = 2.0,  # Weight for visual cosine loss
         # Voxelizer config (defaults match original GaussTR)
         vol_range: List[float] = None,
         voxel_size: float = 0.4,
@@ -145,8 +149,12 @@ class GaussTRLightning(pl.LightningModule):
             'patch_size': head_patch_size,
             'depth_limit': head_depth_limit,
             'text_protos': head_text_protos,
+            'text_protos_sam3': head_text_protos_sam3,
             'prompt_denoising': head_prompt_denoising,
             'num_segment_classes': head_num_segment_classes,
+            'text_loss_weight': head_text_loss_weight,
+            'text_loss_temp': head_text_loss_temp,
+            'cosine_loss_weight': head_cosine_loss_weight,
             'voxelizer_cfg': {
                 'vol_range': vol_range,
                 'voxel_size': voxel_size,
