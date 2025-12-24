@@ -429,9 +429,43 @@ class GaussTRLightning(pl.LightningModule):
                 if i != self.occ_metric.ignore_index:
                     self.log(f'test/iou_{class_name}', results[f'iou_{class_name}'], sync_dist=True)
 
-            # Print formatted table only on rank 0 to avoid duplicate output in multi-GPU testing
+            # Print formatted table with recall/precision on rank 0
             if self.global_rank == 0:
-                print(self.occ_metric.get_table_str())
+                hist = self.occ_metric.hist
+                EPS = 1e-6
+
+                # Per-class metrics
+                tp = torch.diag(hist)
+                fp = hist.sum(dim=0) - tp
+                fn = hist.sum(dim=1) - tp
+                iou = tp / (tp + fp + fn + EPS)
+                recall = tp / (tp + fn + EPS)
+                precision = tp / (tp + fp + EPS)
+
+                # Occ metrics (official formula)
+                free_idx = self.occ_metric.ignore_index
+                tp_occ = hist[:free_idx, :free_idx].sum()
+                total_occ = hist.sum() - hist[free_idx, free_idx]
+                occ_iou = tp_occ / (total_occ + EPS)
+                gt_occ = hist[:free_idx, :].sum()
+                pred_occ = hist[:, :free_idx].sum()
+                occ_recall = tp_occ / (gt_occ + EPS)
+                occ_precision = tp_occ / (pred_occ + EPS)
+
+                print("=" * 80)
+                print("Test Results")
+                print("=" * 80)
+                print(f"  mIoU:       {results['miou']:.4f}")
+                print(f"  Occ IoU:    {occ_iou:.4f}")
+                print(f"  Occ Recall: {occ_recall:.4f}")
+                print(f"  Occ Prec:   {occ_precision:.4f}")
+                print("-" * 80)
+                print(f"{'Class':<25} | {'IoU':<8} | {'Recall':<8} | {'Precision':<8}")
+                print("-" * 80)
+                for i, name in enumerate(self.occ_metric.class_names[:-1]):  # Exclude 'free'
+                    print(f"{name:<25} | {iou[i]:.4f}   | {recall[i]:.4f}   | {precision[i]:.4f}")
+                print("=" * 80)
+
             self.occ_metric.reset()
 
     def configure_optimizers(self):
