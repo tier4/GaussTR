@@ -604,6 +604,142 @@ def create_horizontal_legend(
     return legend
 
 
+def create_3way_comparison(
+    images: Dict[str, np.ndarray],
+    gt_occ: np.ndarray,
+    temporal_occ: np.ndarray,
+    single_occ: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    output_size: Tuple[int, int] = (1800, 1400),
+    free_class: int = 17,
+    title: Optional[str] = None,
+) -> np.ndarray:
+    """Create 3-way comparison: GT vs Temporal vs Single-frame.
+
+    Layout:
+    +--------------------------------------------------+
+    | Row 1: CAM_FL      | CAM_F       | CAM_FR        |
+    +--------------------------------------------------+
+    | Row 2: CAM_BL      | CAM_B       | CAM_BR        |
+    +--------------------------------------------------+
+    | Row 3: GT 3D       | Temporal    | Single-frame  |
+    +--------------------------------------------------+
+    | Row 4-5: Legend (17 classes in 2 rows)           |
+    +--------------------------------------------------+
+
+    Args:
+        images: Dictionary mapping camera names to images.
+        gt_occ: Ground truth 3D occupancy.
+        temporal_occ: Temporal fusion prediction.
+        single_occ: Single-frame prediction.
+        mask: Optional camera visibility mask.
+        output_size: Output image size (width, height).
+        free_class: Class ID for 'free' voxels.
+        title: Optional title text.
+
+    Returns:
+        3-way comparison visualization image.
+    """
+    from .voxel_3d import render_occupancy_3d_to_array
+
+    out_w, out_h = output_size
+
+    # Calculate row heights
+    legend_h = 100
+    available_h = out_h - legend_h
+
+    # Camera rows: 45%, 3D row: 55%
+    cam_total_h = int(available_h * 0.45)
+    cam_row_h = cam_total_h // 2
+    render_row_h = available_h - cam_total_h
+
+    # Create output canvas
+    canvas = np.ones((out_h, out_w, 3), dtype=np.uint8) * 255
+
+    # Row 1-2: Camera views (2x3 grid)
+    front_cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT']
+    back_cams = ['CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+    cam_cell_w = out_w // 3
+
+    # Row 1: Front cameras
+    for i, cam in enumerate(front_cams):
+        if cam in images:
+            img = images[cam]
+            img = cv2.resize(img, (cam_cell_w, cam_row_h), interpolation=cv2.INTER_LINEAR)
+            canvas[:cam_row_h, i * cam_cell_w:(i + 1) * cam_cell_w] = img
+
+    # Row 2: Back cameras (flipped)
+    y_row2 = cam_row_h
+    for i, cam in enumerate(back_cams):
+        if cam in images:
+            img = np.flip(images[cam], axis=1).copy()
+            img = cv2.resize(img, (cam_cell_w, cam_row_h), interpolation=cv2.INTER_LINEAR)
+            canvas[y_row2:y_row2 + cam_row_h, i * cam_cell_w:(i + 1) * cam_cell_w] = img
+
+    # Row 3: 3D visualization (GT | Temporal | Single-frame)
+    y_row3 = cam_total_h
+    third_w = out_w // 3
+
+    # GT 3D
+    try:
+        gt_3d = render_occupancy_3d_to_array(
+            gt_occ,
+            image_size=(third_w, render_row_h),
+            mask=mask,
+            free_class=free_class,
+        )
+        canvas[y_row3:y_row3 + render_row_h, :third_w] = gt_3d
+    except Exception as e:
+        # Fallback to BEV
+        gt_bev = draw_bev_occupancy(gt_occ, output_size=(third_w, render_row_h), free_class=free_class)
+        canvas[y_row3:y_row3 + render_row_h, :third_w] = gt_bev
+
+    # Temporal 3D
+    try:
+        temporal_3d = render_occupancy_3d_to_array(
+            temporal_occ,
+            image_size=(third_w, render_row_h),
+            mask=mask,
+            free_class=free_class,
+        )
+        canvas[y_row3:y_row3 + render_row_h, third_w:2*third_w] = temporal_3d
+    except Exception as e:
+        temporal_bev = draw_bev_occupancy(temporal_occ, output_size=(third_w, render_row_h), free_class=free_class)
+        canvas[y_row3:y_row3 + render_row_h, third_w:2*third_w] = temporal_bev
+
+    # Single-frame 3D
+    try:
+        single_3d = render_occupancy_3d_to_array(
+            single_occ,
+            image_size=(third_w, render_row_h),
+            mask=mask,
+            free_class=free_class,
+        )
+        canvas[y_row3:y_row3 + render_row_h, 2*third_w:] = single_3d
+    except Exception as e:
+        single_bev = draw_bev_occupancy(single_occ, output_size=(third_w, render_row_h), free_class=free_class)
+        canvas[y_row3:y_row3 + render_row_h, 2*third_w:] = single_bev
+
+    # Add labels for Row 3
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    label_y = y_row3 + 30
+    cv2.putText(canvas, "Ground Truth", (10, label_y), font, 0.8, (0, 0, 0), 2)
+    cv2.putText(canvas, "Temporal", (third_w + 10, label_y), font, 0.8, (0, 0, 0), 2)
+    cv2.putText(canvas, "Single-frame", (2*third_w + 10, label_y), font, 0.8, (0, 0, 0), 2)
+
+    # Row 4-5: Legend at bottom
+    y_legend = available_h
+    legend = create_horizontal_legend(width=out_w, height=legend_h)
+    canvas[y_legend:, :] = legend
+
+    # Add title at top
+    if title:
+        cv2.rectangle(canvas, (0, 0), (out_w, 35), (50, 50, 50), -1)
+        cv2.putText(canvas, title, (10, 25), font, 0.8, (255, 255, 255), 2)
+
+    return canvas
+
+
 def save_video(
     frames: List[np.ndarray],
     output_path: str,

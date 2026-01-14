@@ -242,6 +242,30 @@ class TemporalTester:
         self.dynamic_lut = torch.zeros(18, device=device, dtype=torch.bool)
         self.dynamic_lut[self.DYNAMIC_IDS] = True
 
+        # Small static objects (current frame only, high priority)
+        # GT 8=traffic_cone
+        self.SMALL_STATIC_IDS = [8]
+        self.small_static_lut = torch.zeros(18, device=device, dtype=torch.bool)
+        self.small_static_lut[self.SMALL_STATIC_IDS] = True
+
+        # Foreground objects (vehicles, people, cones)
+        # GT 2-10 are foreground objects (excluding barrier which is now background)
+        self.FOREGROUND_IDS = list(range(2, 11))
+        self.foreground_lut = torch.zeros(18, device=device, dtype=torch.bool)
+        self.foreground_lut[self.FOREGROUND_IDS] = True
+
+        # Background static (barrier, road, sidewalk, terrain, manmade, vegetation)
+        # GT 1=barrier, GT 11-16 are background/static environment
+        self.BACKGROUND_IDS = [1, 11, 12, 13, 14, 15, 16]
+        self.background_lut = torch.zeros(18, device=device, dtype=torch.bool)
+        self.background_lut[self.BACKGROUND_IDS] = True
+
+        # Model output indices for background (after merge_probs, 16 classes)
+        # Model 0=barrier, 10=driveable_surface, 11=sidewalk, 12=terrain, 13=manmade, 14=vegetation
+        self.MODEL_BACKGROUND_IDS = [0, 10, 11, 12, 13, 14]
+        self.model_background_lut = torch.zeros(16, device=device, dtype=torch.bool)
+        self.model_background_lut[self.MODEL_BACKGROUND_IDS] = True
+
     @torch.inference_mode()
     def extract_gaussians_batched(self, batch_list: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
         """Batched Inference for Backbone."""
@@ -478,13 +502,140 @@ class TemporalTester:
 
         return final_preds
 
+    def generate_occupancy_early_fusion(
+        self,
+        all_gaussians_transformed: List[Dict[str, torch.Tensor]],
+        current_idx: int,
+        time_decay: float = 0.7,
+        fg_density_threshold: float = 0.1,
+        bg_density_threshold: float = 0.25,
+    ) -> torch.Tensor:
+        """Legacy early fusion - redirects to layered fusion."""
+        return self.generate_occupancy_layered_fusion(
+            all_gaussians_transformed, current_idx, time_decay,
+            fg_density_threshold=fg_density_threshold,
+            bg_density_threshold=bg_density_threshold,
+        )
+
+    def generate_occupancy_layered_fusion(
+        self,
+        all_gaussians_transformed: List[Dict[str, torch.Tensor]],
+        current_idx: int,
+        time_decay: float = 0.7,
+        fg_density_threshold: float = 0.1,
+        bg_density_threshold: float = 0.25,
+    ) -> torch.Tensor:
+        """Layered fusion: separate foreground and background rendering.
+
+        Strategy:
+        - Layer A (Foreground): Dynamic + Small Static from CURRENT FRAME only
+          - Low density threshold (0.04) to preserve recall for small objects
+          - No temporal fusion (dynamic objects can't be motion-compensated)
+        - Layer B (Background): Static background from ALL FRAMES
+          - High density threshold (0.08) to suppress noise
+          - Temporal fusion fills observation gaps
+        - Merge: Foreground wins if valid, else background fills in
+
+        Why this works:
+        - No feature competition between car and road
+        - Foreground stays pure (current frame only)
+        - Background benefits from temporal aggregation
+        """
+        grid_shape = tuple(self.voxelizer.grid_shape)
+        FREE_CLASS = 17
+        T = len(all_gaussians_transformed)
+
+        if T == 0:
+            return torch.full(grid_shape, FREE_CLASS, dtype=torch.long, device=self.device)
+
+        curr_g = all_gaussians_transformed[current_idx]
+        if curr_g is None or len(curr_g['means3d']) == 0:
+            return torch.full(grid_shape, FREE_CLASS, dtype=torch.long, device=self.device)
+
+        # --- 1. Build Foreground Layer (current frame only) ---
+        # Get current frame's predicted classes (model indices 0-15)
+        curr_class_preds = curr_g['semantic_probs'].argmax(-1)
+        # Convert to GT indices: model 0-10 → GT 1-11, model 11-15 → GT 13-17
+        curr_gt_preds = curr_class_preds + (curr_class_preds > 10).long() + 1
+
+        # Foreground = dynamic + small static (traffic cone only)
+        is_foreground = self.dynamic_lut[curr_gt_preds] | self.small_static_lut[curr_gt_preds]
+
+        # Render foreground layer with low threshold
+        fg_preds = torch.full(grid_shape, FREE_CLASS, dtype=torch.long, device=self.device)
+        fg_valid = torch.zeros(grid_shape, dtype=torch.bool, device=self.device)
+
+        if is_foreground.sum() > 0:
+            fg_g = {
+                'means3d': curr_g['means3d'][is_foreground],
+                'opacities': curr_g['opacities'][is_foreground],
+                'semantic_logits': curr_g['semantic_logits'][is_foreground],
+                'scales': curr_g['scales'][is_foreground],
+                'rotations': curr_g['rotations'][is_foreground],
+            }
+            fg_preds, fg_valid, _ = self._voxelize_gaussians(fg_g, fg_density_threshold)
+
+        # --- 2. Build Background Layer (temporal fusion) ---
+        all_bg_means = []
+        all_bg_opacities = []
+        all_bg_features = []
+        all_bg_scales = []
+        all_bg_rotations = []
+
+        for t, g in enumerate(all_gaussians_transformed):
+            if g is None or len(g['means3d']) == 0:
+                continue
+
+            # Get model class predictions
+            g_class_preds = g['semantic_probs'].argmax(-1)  # Model indices 0-15
+
+            # Only keep background classes
+            is_bg = self.model_background_lut[g_class_preds]
+
+            if is_bg.sum() == 0:
+                continue
+
+            weight = time_decay ** abs(t - current_idx)
+            all_bg_means.append(g['means3d'][is_bg])
+            all_bg_opacities.append(g['opacities'][is_bg] * weight)
+            all_bg_features.append(g['semantic_logits'][is_bg])  # No boost needed, no competition
+            all_bg_scales.append(g['scales'][is_bg])
+            all_bg_rotations.append(g['rotations'][is_bg])
+
+        # Render background layer with high threshold
+        bg_preds = torch.full(grid_shape, FREE_CLASS, dtype=torch.long, device=self.device)
+        bg_valid = torch.zeros(grid_shape, dtype=torch.bool, device=self.device)
+
+        if len(all_bg_means) > 0:
+            bg_g = {
+                'means3d': torch.cat(all_bg_means, dim=0),
+                'opacities': torch.cat(all_bg_opacities, dim=0),
+                'semantic_logits': torch.cat(all_bg_features, dim=0),
+                'scales': torch.cat(all_bg_scales, dim=0),
+                'rotations': torch.cat(all_bg_rotations, dim=0),
+            }
+            bg_preds, bg_valid, _ = self._voxelize_gaussians(bg_g, bg_density_threshold)
+
+        # --- 3. Priority Merge: Foreground > Background ---
+        final_preds = torch.full(grid_shape, FREE_CLASS, dtype=torch.long, device=self.device)
+        # First fill with background
+        final_preds = torch.where(bg_valid, bg_preds, final_preds)
+        # Then overlay foreground (higher priority)
+        final_preds = torch.where(fg_valid, fg_preds, final_preds)
+
+        return final_preds
+
     def test_scenes(
         self,
         data_cfg: Dict[str, Any],
         scene_ids: List[str],
         pred_dir: Optional[str] = None,
-        static_min_agreement: float = 2.0,
-        dynamic_min_agreement: float = 1.0,
+        fusion_method: str = 'early',  # 'early' or 'late'
+        time_decay: float = 0.7,  # For early fusion: opacity decay per frame
+        fg_density_threshold: float = 0.1,  # For early fusion: foreground threshold
+        bg_density_threshold: float = 0.25,  # For early fusion: background threshold
+        static_min_agreement: float = 2.0,  # For late fusion only: min votes for static
+        dynamic_min_agreement: float = 1.0,  # For late fusion only: min votes for dynamic
         show_progress: bool = True,
     ) -> Tuple[torch.Tensor, int]:
         from dataset.transforms import LoadMultiViewImages, ImageAug3D, LoadFeatMaps, PackInputs, Compose
@@ -539,7 +690,7 @@ class TemporalTester:
 
         def process_scene_buffer(scene_id, buffer_data):
             if not buffer_data: return
-            
+
             all_ego2global = [f['ego2global'] for f in buffer_data]
             all_gaussians = [f['gaussians'] for f in buffer_data]
 
@@ -548,11 +699,21 @@ class TemporalTester:
                     all_gaussians, all_ego2global, idx
                 )
 
-                pred = self.generate_occupancy_hybrid(
-                    transformed_gaussians, current_idx_in_list,
-                    static_min_agreement=static_min_agreement,
-                    dynamic_min_agreement=dynamic_min_agreement
-                )
+                if fusion_method == 'early':
+                    # Early fusion: layered foreground/background
+                    pred = self.generate_occupancy_early_fusion(
+                        transformed_gaussians, current_idx_in_list,
+                        time_decay=time_decay,
+                        fg_density_threshold=fg_density_threshold,
+                        bg_density_threshold=bg_density_threshold,
+                    )
+                else:
+                    # Late fusion: voxelize each frame, then vote
+                    pred = self.generate_occupancy_hybrid(
+                        transformed_gaussians, current_idx_in_list,
+                        static_min_agreement=static_min_agreement,
+                        dynamic_min_agreement=dynamic_min_agreement
+                    )
 
                 token = buffer_data[idx]['token']
                 
@@ -619,6 +780,10 @@ def _multigpu_worker(
     scene_ids: List[str],
     result_queue: mp.Queue,
     pred_dir: Optional[str],
+    fusion_method: str,
+    time_decay: float,
+    fg_density_threshold: float,
+    bg_density_threshold: float,
     static_min: float,
     dynamic_min: float,
 ):
@@ -645,7 +810,14 @@ def _multigpu_worker(
         )
 
         hist, total_frames = tester.test_scenes(
-            data_cfg, scene_ids, pred_dir, static_min, dynamic_min, show_progress=True
+            data_cfg, scene_ids, pred_dir,
+            fusion_method=fusion_method,
+            time_decay=time_decay,
+            fg_density_threshold=fg_density_threshold,
+            bg_density_threshold=bg_density_threshold,
+            static_min_agreement=static_min,
+            dynamic_min_agreement=dynamic_min,
+            show_progress=True
         )
 
         tester.io_pool.shutdown(wait=True)
@@ -665,8 +837,12 @@ def test_multigpu(
     output_dir: str,
     save_predictions: bool,
     pred_dir: Optional[str],
-    static_min: float,
-    dynamic_min: float,
+    fusion_method: str = 'early',
+    time_decay: float = 0.7,
+    fg_density_threshold: float = 0.1,
+    bg_density_threshold: float = 0.25,
+    static_min: float = 2.0,
+    dynamic_min: float = 1.0,
 ) -> Dict[str, float]:
 
     ann_file = os.path.join(data_cfg['data_root'], 'nuscenes_infos_val.pkl')
@@ -676,9 +852,10 @@ def test_multigpu(
     all_scenes = sorted(set(info['scene_idx'] for info in infos))
 
     print(f"\n{'='*80}")
-    print(f"MULTI-GPU TEMPORAL TEST ({num_gpus} GPUs) - Version 9.0 Fixed")
+    print(f"TEMPORAL TEST ({num_gpus} GPUs) - EARLY FUSION (layered)")
     print(f"{'='*80}")
     print(f"Total scenes: {len(all_scenes)}, Total frames: {len(infos)}")
+    print(f"Fusion: {fusion_method}, time_decay={time_decay}, fg_th={fg_density_threshold}, bg_th={bg_density_threshold}")
 
     assignments = [[] for _ in range(num_gpus)]
     for i, scene in enumerate(all_scenes):
@@ -699,7 +876,9 @@ def test_multigpu(
                 rank, num_gpus, checkpoint_path, model_cfg, temporal_cfg,
                 data_cfg, assignments[rank], result_queue,
                 pred_dir if save_predictions else None,
-                static_min, dynamic_min
+                fusion_method, time_decay,
+                fg_density_threshold, bg_density_threshold,
+                static_min, dynamic_min,
             )
         )
         p.start()
@@ -797,7 +976,10 @@ def main(cfg: DictConfig):
         if not isinstance(temporal_cfg, dict):
             temporal_cfg = OmegaConf.to_container(temporal_cfg, resolve=True)
 
-        method = temporal_cfg.get('method', 'hybrid')
+        fusion_method = temporal_cfg.get('fusion_method', 'early')  # 'early' or 'late'
+        time_decay = float(temporal_cfg.get('time_decay', 0.7))
+        fg_density_threshold = float(temporal_cfg.get('fg_density_threshold', 0.1))
+        bg_density_threshold = float(temporal_cfg.get('bg_density_threshold', 0.25))
         static_min = float(temporal_cfg.get('static_min_agreement', 2.0))
         dynamic_min = float(temporal_cfg.get('dynamic_min_agreement', 1.0))
 
@@ -816,6 +998,10 @@ def main(cfg: DictConfig):
                     output_dir=output_dir,
                     save_predictions=save_predictions,
                     pred_dir=pred_dir,
+                    fusion_method=fusion_method,
+                    time_decay=time_decay,
+                    fg_density_threshold=fg_density_threshold,
+                    bg_density_threshold=bg_density_threshold,
                     static_min=static_min,
                     dynamic_min=dynamic_min,
                 )
@@ -830,6 +1016,10 @@ def main(cfg: DictConfig):
                     output_dir=output_dir,
                     save_predictions=save_predictions,
                     pred_dir=pred_dir,
+                    fusion_method=fusion_method,
+                    time_decay=time_decay,
+                    fg_density_threshold=fg_density_threshold,
+                    bg_density_threshold=bg_density_threshold,
                     static_min=static_min,
                     dynamic_min=dynamic_min,
                 )

@@ -30,6 +30,7 @@ from .composite import (
     create_3d_composite_visualization,
     create_full_composite_visualization,
     create_horizontal_legend,
+    create_3way_comparison,
     save_video,
 )
 from .utils import (
@@ -64,6 +65,7 @@ __all__ = [
     "create_3d_composite_visualization",
     "create_full_composite_visualization",
     "create_horizontal_legend",
+    "create_3way_comparison",
     "save_video",
     # Utilities
     "load_gt_occupancy",
