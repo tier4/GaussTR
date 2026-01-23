@@ -26,6 +26,7 @@ from .voxel_3d import (
 from .composite import (
     create_surround_view,
     create_composite_visualization,
+    create_t4_composite_visualization,
     create_comparison_visualization,
     create_3d_composite_visualization,
     create_full_composite_visualization,
@@ -61,6 +62,7 @@ __all__ = [
     # Composite visualization
     "create_surround_view",
     "create_composite_visualization",
+    "create_t4_composite_visualization",
     "create_comparison_visualization",
     "create_3d_composite_visualization",
     "create_full_composite_visualization",

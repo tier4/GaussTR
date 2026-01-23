@@ -17,6 +17,14 @@ SURROUND_VIEW_ORDER = [
     'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT'
 ]
 
+# T4 camera view order (no back-center camera, two front cameras)
+T4_FRONT_VIEW_ORDER = [
+    'CAM_FRONT_LEFT_WIDE', 'CAM_FRONT', 'CAM_FRONT_RIGHT_WIDE'
+]
+T4_BACK_VIEW_ORDER = [
+    'CAM_BACK_LEFT_WIDE', 'CAM_FRONT_WIDE', 'CAM_BACK_RIGHT_WIDE'
+]
+
 
 def create_surround_view(
     images: Dict[str, np.ndarray],
@@ -142,6 +150,78 @@ def create_composite_visualization(
         canvas[bev_size:, cam_w:] = legend
 
     # Add title
+    if title:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(canvas, title, (10, 30), font, 1, (0, 0, 0), 2)
+
+    return canvas
+
+
+def create_t4_composite_visualization(
+    images: Dict[str, np.ndarray],
+    occupancy: np.ndarray,
+    output_size: Tuple[int, int] = (1600, 900),
+    bev_size: int = 400,
+    free_class: int = 17,
+    show_legend: bool = True,
+    title: Optional[str] = None,
+) -> np.ndarray:
+    """Create composite visualization for T4 (two front cams, no back-center).
+
+    Layout:
+    +-------------------+-------+
+    |  Front cameras    |  BEV  |
+    +-------------------+-------+
+    |  Back/Wide cams   |Legend |
+    +-------------------+-------+
+    """
+    out_w, out_h = output_size
+    cam_w = out_w - bev_size
+    cam_h = out_h // 2
+
+    canvas = np.ones((out_h, out_w, 3), dtype=np.uint8) * 255
+
+    # Front row (no flipping)
+    front_images = []
+    for cam in T4_FRONT_VIEW_ORDER:
+        if cam in images:
+            img = images[cam]
+        else:
+            img = np.zeros((900, 1600, 3), dtype=np.uint8)
+        front_images.append(img)
+    front_row = np.concatenate(front_images, axis=1)
+    front_row = cv2.resize(front_row, (cam_w, cam_h), interpolation=cv2.INTER_LINEAR)
+    canvas[:cam_h, :cam_w] = front_row
+
+    # Back row: flip only true back cameras, keep CAM_FRONT_WIDE unflipped
+    back_images = []
+    for cam in T4_BACK_VIEW_ORDER:
+        if cam in images:
+            img = images[cam]
+            if cam.startswith('CAM_BACK'):
+                img = np.flip(img, axis=1).copy()
+        else:
+            img = np.zeros((900, 1600, 3), dtype=np.uint8)
+        back_images.append(img)
+
+    back_row = np.concatenate(back_images, axis=1)
+    back_row = cv2.resize(back_row, (cam_w, cam_h), interpolation=cv2.INTER_LINEAR)
+    canvas[cam_h:, :cam_w] = back_row
+
+    bev_img = draw_bev_occupancy(
+        occupancy,
+        output_size=(bev_size, bev_size),
+        free_class=free_class,
+        draw_ego=True,
+    )
+    canvas[:bev_size, cam_w:] = bev_img
+
+    if show_legend and bev_size < out_h:
+        legend_h = out_h - bev_size
+        legend = create_legend(height=legend_h)
+        legend = cv2.resize(legend, (bev_size, legend_h), interpolation=cv2.INTER_LINEAR)
+        canvas[bev_size:, cam_w:] = legend
+
     if title:
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(canvas, title, (10, 30), font, 1, (0, 0, 0), 2)

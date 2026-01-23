@@ -129,6 +129,9 @@ class DataConfig:
     input_size: Tuple[int, int] = (432, 768)
     resize_lim: Tuple[float, float] = (0.48, 0.48)
     num_views: int = 6
+    dataset_type: str = "nuscenes"
+    use_camera_subdirs: bool = False
+    has_gt: Optional[bool] = None
 
     batch_size: int = 2
     num_workers: int = 4

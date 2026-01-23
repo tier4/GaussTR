@@ -125,12 +125,19 @@ class VisualizationCallback(pl.Callback):
         from .composite import (
             create_composite_visualization,
             create_comparison_visualization,
+            create_t4_composite_visualization,
             save_video,
         )
         from .utils import load_camera_images, compute_metrics
 
         video_frames = []
         dataset = self._datamodule.test_dataset if self._datamodule else None
+        dataset_type = getattr(self._datamodule, 'dataset_type', '')
+        is_t4 = str(dataset_type).lower() == 't4'
+        if not is_t4 and dataset is not None:
+            cam_names = getattr(dataset, 'camera_names', None)
+            if cam_names and any('WIDE' in name for name in cam_names):
+                is_t4 = True
 
         for result in self._predictions:
             idx = result['idx']
@@ -174,14 +181,19 @@ class VisualizationCallback(pl.Callback):
                 if metrics:
                     title += f" | mIoU: {metrics.get('mIoU', 0):.4f}"
 
-                if gt_occ is not None:
+                if gt_occ is not None and not is_t4:
                     composite = create_comparison_visualization(
                         images, pred_occ, gt_occ, title=title
                     )
                 else:
-                    composite = create_composite_visualization(
-                        images, pred_occ, title=title
-                    )
+                    if is_t4:
+                        composite = create_t4_composite_visualization(
+                            images, pred_occ, title=title
+                        )
+                    else:
+                        composite = create_composite_visualization(
+                            images, pred_occ, title=title
+                        )
 
                 cv2.imwrite(
                     os.path.join(self.output_dir, 'composite', f'{idx:06d}_composite.jpg'),

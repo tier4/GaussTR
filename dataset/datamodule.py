@@ -3,12 +3,13 @@
 Handles data loading, transforms, and dataloader creation.
 """
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
 from .dataset import NuScenesOccDataset, NuScenesOccDatasetV2
+from .t4_dataset import T4Dataset
 from .transforms import get_train_transforms, get_val_transforms, Compose
 from .collate import collate_gausstr
 
@@ -25,6 +26,13 @@ class GaussTRDataModule(pl.LightningDataModule):
         depth_root: Root directory for depth features.
         feats_root: Root directory for image features.
         sem_seg_root: Root directory for semantic segmentation (optional).
+        dataset_type: Dataset identifier ("nuscenes" or "t4").
+        camera_names: Optional ordered list of camera names to load.
+        num_views: Number of camera views.
+        use_camera_subdirs: Whether depth/feature maps are stored per camera.
+        use_chunk_subdirs: Whether to use {chunk_name}/{camera} subdirs (T4 format).
+        sam3_png_format: Whether SAM3 segmentation masks are PNG files.
+        has_gt: Whether occupancy ground truth is available.
         batch_size: Batch size per GPU.
         num_workers: Number of data loading workers.
         pin_memory: Whether to pin memory.
@@ -41,6 +49,13 @@ class GaussTRDataModule(pl.LightningDataModule):
         depth_root: str = 'data/nuscenes_metric3d',
         feats_root: str = 'data/nuscenes_featup',
         sem_seg_root: Optional[str] = None,
+        dataset_type: str = 'nuscenes',
+        camera_names: Optional[List[str]] = None,
+        num_views: int = 6,
+        use_camera_subdirs: bool = False,
+        use_chunk_subdirs: bool = False,
+        sam3_png_format: bool = False,
+        has_gt: Optional[bool] = None,
         batch_size: int = 2,
         num_workers: int = 4,
         pin_memory: bool = True,
@@ -58,6 +73,13 @@ class GaussTRDataModule(pl.LightningDataModule):
         self.depth_root = depth_root
         self.feats_root = feats_root
         self.sem_seg_root = sem_seg_root
+        self.dataset_type = (dataset_type or 'nuscenes').lower()
+        self.camera_names = camera_names
+        self.num_views = num_views
+        self.use_camera_subdirs = use_camera_subdirs
+        self.use_chunk_subdirs = use_chunk_subdirs
+        self.sam3_png_format = sam3_png_format
+        self.has_gt = has_gt if has_gt is not None else self.dataset_type != 't4'
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
@@ -83,11 +105,14 @@ class GaussTRDataModule(pl.LightningDataModule):
                 feats_root=self.feats_root,
                 sem_seg_root=self.sem_seg_root,
                 data_root=self.data_root,
+                num_views=self.num_views,
+                use_camera_subdirs=self.use_camera_subdirs,
+                use_chunk_subdirs=self.use_chunk_subdirs,
+                sam3_png_format=self.sam3_png_format,
             )
 
-            self.train_dataset = NuScenesOccDatasetV2(
+            self.train_dataset = self._build_dataset(
                 ann_file=self.train_ann_file,
-                data_root=self.data_root,
                 transforms=train_transforms,
                 test_mode=False,
             )
@@ -99,12 +124,17 @@ class GaussTRDataModule(pl.LightningDataModule):
                 resize_lim=self.resize_lim,
                 depth_root=self.depth_root,
                 feats_root=self.feats_root,
+                sem_seg_root=self.sem_seg_root,
                 data_root=self.data_root,
+                num_views=self.num_views,
+                use_camera_subdirs=self.use_camera_subdirs,
+                use_chunk_subdirs=self.use_chunk_subdirs,
+                sam3_png_format=self.sam3_png_format,
+                load_gt=self.has_gt,
             )
 
-            self.val_dataset = NuScenesOccDatasetV2(
+            self.val_dataset = self._build_dataset(
                 ann_file=self.val_ann_file,
-                data_root=self.data_root,
                 transforms=val_transforms,
                 test_mode=False,
             )
@@ -116,15 +146,43 @@ class GaussTRDataModule(pl.LightningDataModule):
                 resize_lim=self.resize_lim,
                 depth_root=self.depth_root,
                 feats_root=self.feats_root,
+                sem_seg_root=self.sem_seg_root,
                 data_root=self.data_root,
+                num_views=self.num_views,
+                use_camera_subdirs=self.use_camera_subdirs,
+                use_chunk_subdirs=self.use_chunk_subdirs,
+                sam3_png_format=self.sam3_png_format,
+                load_gt=self.has_gt,
             )
 
-            self.test_dataset = NuScenesOccDatasetV2(
+            self.test_dataset = self._build_dataset(
                 ann_file=self.val_ann_file,
-                data_root=self.data_root,
                 transforms=val_transforms,
                 test_mode=True,
             )
+
+    def _build_dataset(
+        self,
+        ann_file: str,
+        transforms: Optional[Compose],
+        test_mode: bool,
+    ):
+        if self.dataset_type == 't4':
+            return T4Dataset(
+                ann_file=ann_file,
+                data_root=self.data_root,
+                transforms=transforms,
+                test_mode=test_mode,
+                camera_names=self.camera_names,
+            )
+
+        return NuScenesOccDatasetV2(
+            ann_file=ann_file,
+            data_root=self.data_root,
+            transforms=transforms,
+            test_mode=test_mode,
+            camera_names=self.camera_names,
+        )
 
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
@@ -207,6 +265,13 @@ class GaussTRDataModuleFromConfig(GaussTRDataModule):
             depth_root=data_cfg.depth_root,
             feats_root=data_cfg.feats_root,
             sem_seg_root=data_cfg.sem_seg_root,
+            dataset_type=getattr(data_cfg, 'dataset_type', 'nuscenes'),
+            camera_names=getattr(data_cfg, 'camera_names', None),
+            num_views=getattr(data_cfg, 'num_views', 6),
+            use_camera_subdirs=getattr(data_cfg, 'use_camera_subdirs', False),
+            use_chunk_subdirs=getattr(data_cfg, 'use_chunk_subdirs', False),
+            sam3_png_format=getattr(data_cfg, 'sam3_png_format', False),
+            has_gt=getattr(data_cfg, 'has_gt', None),
             batch_size=data_cfg.batch_size,
             num_workers=data_cfg.num_workers,
             pin_memory=getattr(data_cfg, 'pin_memory', True),

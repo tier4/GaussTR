@@ -282,7 +282,7 @@ class GaussTRLightning(pl.LightningModule):
 
         bs, n = images.shape[:2]
 
-        # Forward through neck and decoder (shared with inference)
+        # Forward through neck and decoder
         decoder_outputs = self._forward_features(feats, bs)
         query = decoder_outputs['hidden_states']
         reference_points = decoder_outputs['references']
@@ -307,8 +307,8 @@ class GaussTRLightning(pl.LightningModule):
                 total_loss += v
 
         # Log losses
-        self.log_dict(losses, prog_bar=True, sync_dist=True)
-        self.log('train_loss', total_loss, prog_bar=True, sync_dist=True)
+        self.log_dict(losses, prog_bar=True, sync_dist=True, batch_size=bs)
+        self.log('train_loss', total_loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True, batch_size=bs)
 
         return total_loss
 

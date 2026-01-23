@@ -31,6 +31,7 @@ class NuScenesOccDataset(Dataset):
         data_root: Root directory for nuScenes data.
         transforms: Transform pipeline to apply.
         test_mode: Whether in test mode (no ground truth loading).
+        camera_names: Optional ordered list of camera names to load.
     """
 
     def __init__(
@@ -39,11 +40,13 @@ class NuScenesOccDataset(Dataset):
         data_root: str = 'data/nuscenes',
         transforms: Optional[Callable] = None,
         test_mode: bool = False,
+        camera_names: Optional[List[str]] = None,
     ):
         self.ann_file = ann_file
         self.data_root = data_root
         self.transforms = transforms
         self.test_mode = test_mode
+        self.camera_names = camera_names
 
         # Load annotations
         self.data_infos = self._load_annotations(ann_file)
@@ -115,6 +118,14 @@ class NuScenesOccDataset(Dataset):
 
         # Ensure images dict has full paths
         if 'images' in info:
+            if self.camera_names:
+                ordered_images = {
+                    name: info['images'][name]
+                    for name in self.camera_names
+                    if name in info['images']
+                }
+                info['images'] = ordered_images
+
             for cam_name, cam_info in info['images'].items():
                 img_path = cam_info['img_path']
                 # Skip if already absolute or already contains data_root
@@ -160,6 +171,14 @@ class NuScenesOccDatasetV2(NuScenesOccDataset):
 
         # V2 format stores images in 'images' dict with cam names as keys
         if 'images' in info:
+            if self.camera_names:
+                ordered_images = {
+                    name: info['images'][name]
+                    for name in self.camera_names
+                    if name in info['images']
+                }
+                info['images'] = ordered_images
+
             for cam_name, cam_info in info['images'].items():
                 img_path = cam_info.get('img_path', '')
                 # Skip if already absolute or already contains data_root
@@ -197,6 +216,7 @@ def create_nuscenes_dataset(
     transforms: Optional[Callable] = None,
     test_mode: bool = False,
     use_v2_format: bool = True,
+    camera_names: Optional[List[str]] = None,
 ) -> Dataset:
     """Factory function to create NuScenes occupancy dataset.
 
@@ -216,4 +236,5 @@ def create_nuscenes_dataset(
         data_root=data_root,
         transforms=transforms,
         test_mode=test_mode,
+        camera_names=camera_names,
     )

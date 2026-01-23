@@ -239,6 +239,40 @@ class ImageAug3D:
         return data
 
 
+def _extract_chunk_name(path: str) -> str:
+    """Extract chunk name from T4 image path.
+
+    Path format: .../t4_datasets/{chunk_name}/data/{camera}/{filename}.jpg
+    """
+    parts = path.replace("\\", "/").split("/")
+    for i, part in enumerate(parts):
+        if part == "t4_datasets" and i + 1 < len(parts):
+            return parts[i + 1]
+    return ""
+
+
+def _load_sparse_depth(path: str) -> np.ndarray:
+    """Load sparse depth from .npz file and reconstruct dense array."""
+    data = np.load(path)
+    indices = data['indices']  # [N, 2] (row, col)
+    values = data['values']    # [N] depth values
+    shape = tuple(data['shape'])  # (H, W)
+
+    # Reconstruct dense depth map
+    depth = np.zeros(shape, dtype=np.float32)
+    if len(indices) > 0:
+        depth[indices[:, 0], indices[:, 1]] = values.astype(np.float32)
+    return depth
+
+
+def _load_png_as_array(path: str) -> np.ndarray:
+    """Load PNG image as numpy array (for SAM3 segmentation masks)."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Failed to load PNG: {path}")
+    return img
+
+
 class LoadFeatMaps:
     """Load pre-extracted feature maps.
 
@@ -248,6 +282,12 @@ class LoadFeatMaps:
         apply_aug: Whether to apply image augmentation to features.
         suffix: Optional suffix for feature filenames.
         use_mmap: Use memory-mapped loading for large datasets (reduces RAM usage).
+        use_camera_subdirs: If True, load from per-camera subdirectories.
+        use_chunk_subdirs: If True, load from {chunk_name}/{camera} subdirectories (T4 format).
+        png_format: If True, load PNG files instead of numpy (for SAM3 segmentation masks).
+
+    Note:
+        File format is auto-detected based on extension (.npy, .npz, or .png).
     """
 
     def __init__(
@@ -256,13 +296,19 @@ class LoadFeatMaps:
         key: str,
         apply_aug: bool = False,
         suffix: str = '',
-        use_mmap: bool = False
+        use_mmap: bool = False,
+        use_camera_subdirs: bool = False,
+        use_chunk_subdirs: bool = False,
+        png_format: bool = False
     ):
         self.data_root = data_root
         self.key = key
         self.apply_aug = apply_aug
         self.suffix = suffix
         self.use_mmap = use_mmap
+        self.use_camera_subdirs = use_camera_subdirs
+        self.use_chunk_subdirs = use_chunk_subdirs
+        self.png_format = png_format
 
     def __call__(self, results: Dict) -> Dict:
         """Load feature maps for all views."""
@@ -272,14 +318,54 @@ class LoadFeatMaps:
         for i, filename in enumerate(results['filename']):
             # Build feature path
             basename = os.path.basename(filename).split('.')[0]
-            feat_path = os.path.join(self.data_root, basename + self.suffix + '.npy')
+            cam_name = os.path.basename(os.path.dirname(filename))
 
-            # Use memory-mapped loading if enabled (lazy loading, OS handles caching)
-            if self.use_mmap:
-                feat = np.load(feat_path, mmap_mode='r')
-                feat = np.array(feat)  # Copy to allow modification
+            # Build base path without extension
+            if self.use_chunk_subdirs:
+                # T4 format: {data_root}/{chunk_name}/{cam_name}/{basename}
+                chunk_name = _extract_chunk_name(filename)
+                base_path = os.path.join(
+                    self.data_root,
+                    chunk_name,
+                    cam_name,
+                    basename + self.suffix
+                )
+            elif self.use_camera_subdirs:
+                base_path = os.path.join(
+                    self.data_root,
+                    cam_name,
+                    basename + self.suffix
+                )
             else:
-                feat = np.load(feat_path)
+                base_path = os.path.join(self.data_root, basename + self.suffix)
+
+            # Auto-detect file format based on extension
+            if self.png_format:
+                feat_path = base_path + '.png'
+                feat = _load_png_as_array(feat_path)
+            elif os.path.exists(base_path + '.npy'):
+                feat_path = base_path + '.npy'
+                if self.use_mmap:
+                    feat = np.load(feat_path, mmap_mode='r')
+                    feat = np.array(feat)  # Copy to allow modification
+                else:
+                    feat = np.load(feat_path)
+            elif os.path.exists(base_path + '.npz'):
+                feat_path = base_path + '.npz'
+                feat = _load_sparse_depth(feat_path)
+            else:
+                raise FileNotFoundError(
+                    f"Feature file not found: {base_path}.[npy|npz]"
+                )
+
+            # Handle int8 quantized features (convert back to float32)
+            # Skip for PNG segmentation masks which are uint8 class labels
+            if feat.dtype == np.int8:
+                feat = feat.astype(np.float32) / 127.0
+            elif self.png_format:
+                # PNG segmentation masks - keep as integer class labels
+                feat = feat.astype(np.int64)
+
             feat = torch.from_numpy(feat)
 
             # Apply augmentation if needed
@@ -288,7 +374,10 @@ class LoadFeatMaps:
                 post_tran = img_aug_mats[i][:3, 3]
 
                 h, w = feat.shape[-2:]
-                mode = 'nearest' if feat.dtype in [torch.long, torch.int] else 'bilinear'
+                # Use nearest neighbor for segmentation masks (PNG format or integer dtype)
+                # For depth maps, bilinear is fine since dense depth has no zeros to interpolate with
+                is_segmentation = self.png_format or feat.dtype in [torch.long, torch.int, torch.int64, torch.int32]
+                mode = 'nearest' if is_segmentation else 'bilinear'
 
                 # Resize
                 new_h = int(h * post_rot[1, 1] + 0.5)
@@ -388,7 +477,11 @@ def get_train_transforms(
     depth_root: str = 'data/nuscenes_unidepth',
     feats_root: str = 'data/nuscenes_featup',
     sem_seg_root: Optional[str] = 'data/nuscenes_sam3',
-    data_root: str = 'data/nuscenes'
+    data_root: str = 'data/nuscenes',
+    num_views: int = 6,
+    use_camera_subdirs: bool = False,
+    use_chunk_subdirs: bool = False,
+    sam3_png_format: bool = False,
 ) -> Compose:
     """Get training transforms.
 
@@ -399,24 +492,46 @@ def get_train_transforms(
         feats_root: Root for image features.
         sem_seg_root: Root for semantic segmentation.
         data_root: Root for nuScenes data.
+        num_views: Number of camera views.
+        use_camera_subdirs: Whether to load depth/features from per-camera subdirs.
+        use_chunk_subdirs: Whether to use {chunk_name}/{camera} subdirs (T4 format).
+        sam3_png_format: Whether SAM3 segmentation masks are PNG files.
 
     Returns:
         Composed transforms.
     """
     transforms = [
-        LoadMultiViewImages(to_float32=True, num_views=6, data_root=data_root),
+        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root),
         ImageAug3D(
             final_dim=input_size,
             resize_lim=resize_lim,
             is_train=True
         ),
-        LoadFeatMaps(data_root=depth_root, key='depth', apply_aug=True),
-        LoadFeatMaps(data_root=feats_root, key='feats'),
+        LoadFeatMaps(
+            data_root=depth_root,
+            key='depth',
+            apply_aug=True,
+            use_camera_subdirs=use_camera_subdirs,
+            use_chunk_subdirs=use_chunk_subdirs,
+        ),
+        LoadFeatMaps(
+            data_root=feats_root,
+            key='feats',
+            use_camera_subdirs=use_camera_subdirs,
+            use_chunk_subdirs=use_chunk_subdirs,
+        ),
     ]
 
     if sem_seg_root:
         transforms.append(
-            LoadFeatMaps(data_root=sem_seg_root, key='sem_seg', apply_aug=True)
+            LoadFeatMaps(
+                data_root=sem_seg_root,
+                key='sem_seg',
+                apply_aug=True,
+                use_camera_subdirs=use_camera_subdirs,
+                use_chunk_subdirs=use_chunk_subdirs,
+                png_format=sam3_png_format,
+            )
         )
 
     transforms.append(PackInputs())
@@ -429,7 +544,13 @@ def get_val_transforms(
     resize_lim: Tuple[float, float] = (0.48, 0.48),
     depth_root: str = 'data/nuscenes_unidepth',
     feats_root: str = 'data/nuscenes_featup',
-    data_root: str = 'data/nuscenes'
+    sem_seg_root: Optional[str] = None,
+    data_root: str = 'data/nuscenes',
+    num_views: int = 6,
+    use_camera_subdirs: bool = False,
+    use_chunk_subdirs: bool = False,
+    sam3_png_format: bool = False,
+    load_gt: bool = True
 ) -> Compose:
     """Get validation transforms.
 
@@ -438,22 +559,57 @@ def get_val_transforms(
         resize_lim: Resize limits.
         depth_root: Root for depth features.
         feats_root: Root for image features.
+        sem_seg_root: Root for semantic segmentation (optional).
         data_root: Root for nuScenes data.
+        num_views: Number of camera views.
+        use_camera_subdirs: Whether to load depth/features from per-camera subdirs.
+        use_chunk_subdirs: Whether to use {chunk_name}/{camera} subdirs (T4 format).
+        sam3_png_format: Whether SAM3 segmentation masks are PNG files.
+        load_gt: Whether to load occupancy ground truth.
 
     Returns:
         Composed transforms.
     """
     transforms = [
-        LoadMultiViewImages(to_float32=True, num_views=6, data_root=data_root),
-        LoadOccFromFile(),
+        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root),
+    ]
+
+    if load_gt:
+        transforms.append(LoadOccFromFile())
+
+    transforms.extend([
         ImageAug3D(
             final_dim=input_size,
             resize_lim=resize_lim,
             is_train=False
         ),
-        LoadFeatMaps(data_root=depth_root, key='depth', apply_aug=True),
-        LoadFeatMaps(data_root=feats_root, key='feats'),
-        PackInputs(),
-    ]
+        LoadFeatMaps(
+            data_root=depth_root,
+            key='depth',
+            apply_aug=True,
+            use_camera_subdirs=use_camera_subdirs,
+            use_chunk_subdirs=use_chunk_subdirs,
+        ),
+        LoadFeatMaps(
+            data_root=feats_root,
+            key='feats',
+            use_camera_subdirs=use_camera_subdirs,
+            use_chunk_subdirs=use_chunk_subdirs,
+        ),
+    ])
+
+    if sem_seg_root:
+        transforms.append(
+            LoadFeatMaps(
+                data_root=sem_seg_root,
+                key='sem_seg',
+                apply_aug=True,
+                use_camera_subdirs=use_camera_subdirs,
+                use_chunk_subdirs=use_chunk_subdirs,
+                png_format=sam3_png_format,
+            )
+        )
+
+    transforms.append(PackInputs())
 
     return Compose(transforms)

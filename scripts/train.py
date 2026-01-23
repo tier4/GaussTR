@@ -212,12 +212,21 @@ def build_callbacks(cfg: DictConfig, checkpoint_dir: str, log_artifacts: bool = 
     """
     callbacks = []
 
+    has_gt = cfg.get('data', {}).get('has_gt', True)
+    monitor_metric = 'val/miou' if has_gt else 'train_loss'
+    monitor_mode = 'max' if has_gt else 'min'
+    filename_tmpl = (
+        'epoch{epoch:02d}-miou{val/miou:.4f}'
+        if has_gt else
+        'epoch{epoch:02d}-trainloss{train_loss:.4f}'
+    )
+
     # Model checkpoint - save under run_name subdirectory
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename='epoch{epoch:02d}-miou{val/miou:.4f}',
-        monitor='val/miou',
-        mode='max',
+        filename=filename_tmpl,
+        monitor=monitor_metric,
+        mode=monitor_mode,
         save_top_k=3,
         save_last=True,
         verbose=True,
@@ -235,9 +244,9 @@ def build_callbacks(cfg: DictConfig, checkpoint_dir: str, log_artifacts: bool = 
     # Early stopping (optional)
     if cfg.get('early_stopping', False):
         early_stop = EarlyStopping(
-            monitor='val/miou',
+            monitor=monitor_metric,
             patience=cfg.get('early_stopping_patience', 5),
-            mode='max',
+            mode=monitor_mode,
             verbose=True,
         )
         callbacks.append(early_stop)

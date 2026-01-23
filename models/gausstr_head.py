@@ -270,11 +270,12 @@ class GaussTRHead(nn.Module):
         bs, n = cam2img.shape[:2]
         x = x.reshape((bs, n) + tuple(x.shape[1:]))
 
+        # Reshape ref_pts to [B, N, Q, 2] before any modification
+        ref_pts_reshaped = ref_pts.reshape(tuple(x.shape[:-1]) + (-1,))
+
         # Predict Gaussian position deltas
         deltas = self.regress_head(x)
-        ref_pts = (
-            deltas[..., :2] +
-            inverse_sigmoid(ref_pts.reshape(tuple(x.shape[:-1]) + (-1,)))).sigmoid()
+        ref_pts = (deltas[..., :2] + inverse_sigmoid(ref_pts_reshaped)).sigmoid()
 
         # Sample depth at reference points
         # depth shape: [B, N, H, W] - same as original implementation
@@ -282,6 +283,7 @@ class GaussTRHead(nn.Module):
         depth = depth.clamp(max=self.depth_limit)
         if depth.dim() == 5:
             depth = depth.squeeze(2)  # [B, N, 1, H, W] -> [B, N, H, W]
+
         # Add channel dim temporarily for grid_sample (original: depth[:, :n, None])
         sample_depth = flatten_bsn_forward(
             F.grid_sample, depth[:, :n, None],
@@ -387,10 +389,17 @@ class GaussTRHead(nn.Module):
         depth = torch.where(depth < self.depth_limit, depth,
                             1e-3).flatten(0, 1)
 
+        # Resize depth to match rendered_depth shape
+        if depth.shape[-2:] != rendered_depth.shape[-2:]:
+            depth = F.interpolate(
+                depth.unsqueeze(1),
+                size=rendered_depth.shape[-2:], mode='nearest'
+            ).squeeze(1)
+
         # Create sky mask to ignore sky pixels (class 17) in depth loss
         sky_mask = None
         if sem_segs is not None:
-            # Resize sem_segs to match depth size
+            # Resize sem_segs to match rendered depth size
             sky_mask = F.interpolate(
                 sem_segs.flatten(0, 1).unsqueeze(1).float(),
                 size=rendered_depth.shape[-2:], mode='nearest'
@@ -403,8 +412,10 @@ class GaussTRHead(nn.Module):
 
         # Feature loss
         bsn, c, h, w = rendered.shape
-        feat_h = self.image_shape[0] // self.patch_size
-        feat_w = self.image_shape[1] // self.patch_size
+        # Get actual feature spatial dimensions from the original feats tensor
+        # feats: [B, N, C, H_feat, W_feat]
+        feat_h = feats.shape[-2]
+        feat_w = feats.shape[-1]
         tgt_feats = tgt_feats.mT.reshape(bsn, c, feat_h, feat_w)
         tgt_feats = F.interpolate(
             tgt_feats, size=(h, w), mode='bilinear', align_corners=False)

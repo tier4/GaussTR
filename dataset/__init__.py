@@ -8,6 +8,11 @@ from .dataset import (
     OCC_CLASSES,
     LABEL2CAT,
 )
+from .t4_dataset import (
+    T4Dataset,
+    create_t4_dataset,
+    T4_CAMERA_NAMES,
+)
 from .transforms import (
     LoadMultiViewImages,
     ImageAug3D,
@@ -17,6 +22,11 @@ from .transforms import (
     Compose,
     get_train_transforms,
     get_val_transforms,
+)
+from .lidar_to_depth import (
+    load_lidar_pcd_bin,
+    project_lidar_to_camera,
+    interpolate_depth,
 )
 from .collate import (
     collate_gausstr,
@@ -34,6 +44,9 @@ __all__ = [
     "create_nuscenes_dataset",
     "OCC_CLASSES",
     "LABEL2CAT",
+    "T4Dataset",
+    "create_t4_dataset",
+    "T4_CAMERA_NAMES",
     # Transforms
     "LoadMultiViewImages",
     "ImageAug3D",
@@ -43,6 +56,9 @@ __all__ = [
     "Compose",
     "get_train_transforms",
     "get_val_transforms",
+    "load_lidar_pcd_bin",
+    "project_lidar_to_camera",
+    "interpolate_depth",
     # Collate
     "collate_gausstr",
     "collate_gausstr_inference",
