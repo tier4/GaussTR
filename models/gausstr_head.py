@@ -423,12 +423,6 @@ class GaussTRHead(nn.Module):
 
         losses = {}
 
-        # Add monitoring metrics (detached, won't affect gradients)
-        losses['dz_mean'] = deltas[..., 2].detach().mean()
-        losses['dz_max'] = deltas[..., 2].detach().abs().max()
-        losses['opacity'] = opacities.detach().mean()
-        losses['rd_mean'] = rendered_depth.detach().mean()
-
         # Position loss: directly supervise Gaussian depth positions
         # This prevents opacity cheating when using RGB+ED mode
         # adjusted_depth: [B, N, Q, 1] - Gaussian's actual depth = sample_depth * (1 + delta_z)
@@ -462,10 +456,11 @@ class GaussTRHead(nn.Module):
             ).squeeze(1).long()
             sky_mask = (sky_mask != 17)  # True for non-sky pixels
 
-        # Compute depth loss with sky mask (edge-aware enabled for training loss)
-        losses['loss_depth'] = self.depth_loss(rendered_depth, depth_for_loss, sky_mask=sky_mask, edge_aware=True)
-        # MAE for monitoring only (no edge-aware, just raw L1)
-        losses['mae_depth'] = self.depth_loss(rendered_depth, depth_for_loss, criterion='l1', sky_mask=sky_mask, edge_aware=False)
+        # Compute depth losses with sky mask
+        losses['loss_depth'] = self.depth_loss(rendered_depth, depth_for_loss, sky_mask=sky_mask)
+        # Edge-aware depth loss (separate, logged individually)
+        if self.edge_loss_weight > 0:
+            losses['loss_edge'] = self.edge_depth_loss(rendered_depth, depth_for_loss, sky_mask=sky_mask) * self.edge_loss_weight
 
         # Feature loss
         bsn, c, h, w = rendered.shape
@@ -552,46 +547,19 @@ class GaussTRHead(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         criterion: str = 'silog_l1',
-        sky_mask: Optional[torch.Tensor] = None,
-        edge_aware: bool = True
+        sky_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Compute depth loss with optional sky mask and edge-aware weighting.
+        """Compute depth loss with optional sky mask.
 
         Args:
             pred: Predicted depth [B, H, W]
             target: Target depth [B, H, W]
             criterion: Loss criterion ('silog', 'l1', or 'silog_l1')
             sky_mask: Boolean mask [B, H, W], True for valid (non-sky) pixels
-            edge_aware: Whether to add edge-aware loss component
 
         Returns:
-            Combined depth loss
+            Depth loss (SiLog + 0.2*L1 by default)
         """
-        # Compute edge-aware loss BEFORE applying sky mask (need 2D structure)
-        edge_loss = torch.tensor(0.0, device=pred.device)
-        if edge_aware and self.edge_loss_weight > 0:
-            # Compute edge weights from target depth
-            edge_weights = self.compute_depth_edges(target)  # [B, H, W]
-
-            # Compute per-pixel L1 error
-            pixel_error = (pred - target).abs()
-
-            # Apply sky mask if provided
-            if sky_mask is not None:
-                edge_weights = edge_weights * sky_mask.float()
-                pixel_error = pixel_error * sky_mask.float()
-                valid_count = sky_mask.float().sum().clamp(min=1)
-            else:
-                valid_mask = target > 0
-                edge_weights = edge_weights * valid_mask.float()
-                pixel_error = pixel_error * valid_mask.float()
-                valid_count = valid_mask.float().sum().clamp(min=1)
-
-            # Edge-weighted loss: higher weight at depth discontinuities
-            # Add base weight of 1.0 so all pixels contribute, edges contribute more
-            weighted_error = pixel_error * (1.0 + edge_weights)
-            edge_loss = weighted_error.sum() / valid_count
-
         # Apply sky mask for standard losses
         if sky_mask is not None:
             pred = pred[sky_mask]
@@ -609,11 +577,47 @@ class GaussTRHead(nn.Module):
                     l1_loss *= 0.2
                 loss += l1_loss
 
-        # Add edge-aware component
-        if edge_aware and self.edge_loss_weight > 0:
-            loss = loss + self.edge_loss_weight * edge_loss
-
         return loss
+
+    def edge_depth_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        sky_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute edge-aware depth loss using Sobel edge detection.
+
+        Args:
+            pred: Predicted depth [B, H, W]
+            target: Target depth [B, H, W]
+            sky_mask: Boolean mask [B, H, W], True for valid (non-sky) pixels
+
+        Returns:
+            Edge-weighted L1 loss
+        """
+        # Compute edge weights from target depth
+        edge_weights = self.compute_depth_edges(target)  # [B, H, W]
+
+        # Compute per-pixel L1 error
+        pixel_error = (pred - target).abs()
+
+        # Apply sky mask if provided
+        if sky_mask is not None:
+            edge_weights = edge_weights * sky_mask.float()
+            pixel_error = pixel_error * sky_mask.float()
+            valid_count = sky_mask.float().sum().clamp(min=1)
+        else:
+            valid_mask = target > 0
+            edge_weights = edge_weights * valid_mask.float()
+            pixel_error = pixel_error * valid_mask.float()
+            valid_count = valid_mask.float().sum().clamp(min=1)
+
+        # Edge-weighted loss: higher weight at depth discontinuities
+        # Add base weight of 1.0 so all pixels contribute, edges contribute more
+        weighted_error = pixel_error * (1.0 + edge_weights)
+        edge_loss = weighted_error.sum() / valid_count
+
+        return edge_loss
 
     def scale_transform(
         self,
