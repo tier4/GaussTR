@@ -49,6 +49,7 @@ model:
   # Original loss weights (hardcoded): loss_depth: 1.0, loss_cosine: 5.0, loss_ce: 1.0
   head_text_loss_weight: 3.0  # Additional text contrastive loss weight
   head_position_loss_weight: 1.0  # Position loss to prevent opacity cheating with RGB+ED
+  head_edge_loss_weight: 0.5  # Edge-aware depth loss weight (P0-A improvement)
   head_pca_path: "ckpts/t4_pca_front_wide.pth"  # Pre-computed PCA for single-view stability
 
   vol_range: [-40, -40, -1, 40, 40, 5.4]

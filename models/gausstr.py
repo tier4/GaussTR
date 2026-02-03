@@ -58,6 +58,7 @@ class GaussTRLightning(pl.LightningModule):
         head_cosine_loss_weight: float = 2.0,  # Weight for visual cosine loss
         head_depth_loss_weight: float = 1.0,  # Weight for depth loss
         head_position_loss_weight: float = 1.0,  # Weight for position loss (prevents opacity cheating)
+        head_edge_loss_weight: float = 0.5,  # Weight for edge-aware depth loss
         head_depth_warmup_iters: int = 0,  # Warmup steps to ramp depth loss weight
         head_pca_path: Optional[str] = None,  # Pre-computed PCA for single-view datasets
         # Voxelizer config (defaults match original GaussTR)
@@ -165,6 +166,7 @@ class GaussTRLightning(pl.LightningModule):
             'cosine_loss_weight': head_cosine_loss_weight,
             'depth_loss_weight': head_depth_loss_weight,
             'position_loss_weight': head_position_loss_weight,
+            'edge_loss_weight': head_edge_loss_weight,
             'pca_path': head_pca_path,
             'voxelizer_cfg': {
                 'vol_range': vol_range,
