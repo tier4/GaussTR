@@ -111,15 +111,8 @@ class SiLogLoss(nn.Module):
         self.lambd = lambd
         self.eps = eps
 
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         valid = target > 0
-        if mask is not None:
-            valid = valid & mask  # Also exclude sky pixels
         if valid.sum() == 0:
             return torch.tensor(0.0, device=pred.device)
 
@@ -171,11 +164,16 @@ class GaussTRHead(nn.Module):
         voxelizer_cfg: Optional[Dict[str, Any]] = None,
         text_loss_weight: float = 3.0,
         text_loss_temp: float = 0.1,
-        cosine_loss_weight: float = 2.0
+        cosine_loss_weight: float = 2.0,
+        depth_loss_weight: float = 1.0,
+        position_loss_weight: float = 1.0,
+        pca_path: Optional[str] = None,
+        density_thresh: float = 1e-3
     ):
         super().__init__()
 
         self.reduce_dims = reduce_dims
+        self.density_thresh = density_thresh
         self.image_shape = image_shape
         self.render_image_size = render_image_size
         self.patch_size = patch_size
@@ -186,6 +184,8 @@ class GaussTRHead(nn.Module):
         self.text_loss_weight = text_loss_weight
         self.text_loss_temp = text_loss_temp
         self.cosine_loss_weight = cosine_loss_weight
+        self.depth_loss_weight = depth_loss_weight
+        self.position_loss_weight = position_loss_weight
 
         # Prediction heads
         self.opacity_head = MLP(embed_dims, output_dim=1, mode='sigmoid')
@@ -231,10 +231,29 @@ class GaussTRHead(nn.Module):
         # Loss
         self.silog_loss = SiLogLoss()
 
-        # EMA for PCA - 10% weight for new updates
+        # PCA for dimensionality reduction
+        # Option 1: Load pre-computed PCA (recommended for single-view datasets like T4)
+        # Option 2: Compute per-batch PCA with EMA smoothing (works for multi-view)
         self.pca_ema_momentum = 0.1
         self.register_buffer('pca_v', torch.zeros(feat_dims, reduce_dims))
         self.register_buffer('pca_initialized', torch.tensor(0, dtype=torch.long))
+
+        if pca_path is not None and pca_path:
+            pca_data = torch.load(pca_path, map_location='cpu', weights_only=True)
+            pca_v = pca_data['v']  # [feat_dims, reduce_dims]
+            # Verify dimensions match
+            if pca_v.shape[0] != feat_dims or pca_v.shape[1] != reduce_dims:
+                raise ValueError(
+                    f"PCA dimensions mismatch: expected ({feat_dims}, {reduce_dims}), "
+                    f"got {pca_v.shape}. Re-run precompute_pca.py with --reduce_dims {reduce_dims}"
+                )
+            self.pca_v.copy_(pca_v)
+            self.pca_initialized.fill_(1)
+            self.use_fixed_pca = True
+            print(f"[GaussTRHead] Loaded pre-computed PCA from {pca_path} "
+                  f"(variance explained: {pca_data.get('variance_explained', 0)*100:.1f}%)")
+        else:
+            self.use_fixed_pca = False
 
     def forward(
         self,
@@ -247,6 +266,8 @@ class GaussTRHead(nn.Module):
         feats: Optional[torch.Tensor] = None,
         img_aug_mat: Optional[torch.Tensor] = None,
         sem_segs: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,
+        debug_step: bool = False,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """Forward pass.
@@ -273,16 +294,18 @@ class GaussTRHead(nn.Module):
         # Reshape ref_pts to [B, N, Q, 2] before any modification
         ref_pts_reshaped = ref_pts.reshape(tuple(x.shape[:-1]) + (-1,))
 
-        # Predict Gaussian position deltas
+        # Predict Gaussian position deltas (no constraints on z-delta)
         deltas = self.regress_head(x)
         ref_pts = (deltas[..., :2] + inverse_sigmoid(ref_pts_reshaped)).sigmoid()
 
         # Sample depth at reference points
         # depth shape: [B, N, H, W] - same as original implementation
         # Squeeze if [B, N, 1, H, W] to match original 4D format
-        depth = depth.clamp(max=self.depth_limit)
         if depth.dim() == 5:
             depth = depth.squeeze(2)  # [B, N, 1, H, W] -> [B, N, H, W]
+
+        # Clamp depth for geometry/sampling (avoids extreme Gaussian positions)
+        depth = depth.clamp(max=self.depth_limit)
 
         # Add channel dim temporarily for grid_sample (original: depth[:, :n, None])
         sample_depth = flatten_bsn_forward(
@@ -292,9 +315,11 @@ class GaussTRHead(nn.Module):
         sample_depth = sample_depth[:, :, 0, 0, :, None]
 
         # Compute 3D points from 2D reference points + depth
+        # Clamp adjusted depth to [0.1, depth_limit] to prevent log(0) in SiLogLoss
+        adjusted_depth = (sample_depth * (1 + deltas[..., 2:3])).clamp(min=0.1, max=self.depth_limit)
         points = torch.cat([
             ref_pts * self.image_shape_tensor,
-            sample_depth * (1 + deltas[..., 2:3])
+            adjusted_depth
         ], -1)
         means3d = cam2world(points, cam2img, cam2ego, img_aug_mat)
 
@@ -328,38 +353,43 @@ class GaussTRHead(nn.Module):
             probs = merge_probs(probs, OCC3D_CATEGORIES)
             preds = probs.argmax(-1)
             preds += (preds > 10) * 1 + 1  # skip two classes of "others"
-            preds = torch.where(density.squeeze(-1) > 4e-2, preds, 17)
+            preds = torch.where(density.squeeze(-1) > self.density_thresh, preds, 17)
 
             return preds
 
         # Training mode: render and compute losses
         tgt_feats = feats.flatten(-2).mT.float()  # [B*N, H*W, C]
 
-        # PCA for dimensionality reduction (GPU, FP32) with EMA smoothing
+        # PCA for dimensionality reduction
         with torch.amp.autocast('cuda', enabled=False):
-            u, s, v = torch.pca_lowrank(
-                tgt_feats.flatten(0, 2), q=self.reduce_dims, niter=4)
+            if self.use_fixed_pca:
+                # Use pre-computed fixed PCA (recommended for single-view datasets)
+                v = self.pca_v
+            else:
+                # Compute per-batch PCA with EMA smoothing (for multi-view datasets)
+                u, s, v = torch.pca_lowrank(
+                    tgt_feats.flatten(0, 2), q=self.reduce_dims, niter=4)
 
-            # EMA update for PCA to stabilize training
-            if self.training:
-                if self.pca_initialized.item() == 0:
-                    self.pca_v.copy_(v)
-                    self.pca_initialized.fill_(1)
-                else:
-                    # Align signs to handle PCA sign ambiguity
-                    sign = torch.sign((self.pca_v * v).sum(dim=0, keepdim=True))
-                    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-                    v_aligned = v * sign
-                    # EMA: 90% old + 10% new
-                    self.pca_v.mul_(1 - self.pca_ema_momentum).add_(
-                        v_aligned * self.pca_ema_momentum)
+                # EMA update for PCA to stabilize training
+                if self.training:
+                    if self.pca_initialized.item() == 0:
+                        self.pca_v.copy_(v)
+                        self.pca_initialized.fill_(1)
+                    else:
+                        # Align signs to handle PCA sign ambiguity
+                        sign = torch.sign((self.pca_v * v).sum(dim=0, keepdim=True))
+                        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                        v_aligned = v * sign
+                        # EMA: 90% old + 10% new
+                        self.pca_v.mul_(1 - self.pca_ema_momentum).add_(
+                            v_aligned * self.pca_ema_momentum)
 
-                # Sync pca_v across GPUs in distributed training to prevent divergence
-                if dist.is_initialized():
-                    dist.all_reduce(self.pca_v, op=dist.ReduceOp.AVG)
+                    # Sync pca_v across GPUs in distributed training to prevent divergence
+                    if dist.is_initialized():
+                        dist.all_reduce(self.pca_v, op=dist.ReduceOp.AVG)
 
-            # Project features using EMA-smoothed PCA
-            v = self.pca_v
+                # Use EMA-smoothed PCA
+                v = self.pca_v
 
         tgt_feats = tgt_feats @ v
         features = features @ v
@@ -377,7 +407,7 @@ class GaussTRHead(nn.Module):
             image_size=self.render_image_size,
             near_plane=0.1,
             far_plane=100,
-            render_mode='RGB+D',
+            render_mode='RGB+ED',
             channel_chunk=32).flatten(0, 1)
 
         rendered_depth = rendered[:, -1]
@@ -385,35 +415,51 @@ class GaussTRHead(nn.Module):
 
         losses = {}
 
-        # Depth loss - depth is [B, N, H, W], flatten to [B*N, H, W] to match rendered_depth
-        depth = torch.where(depth < self.depth_limit, depth,
-                            1e-3).flatten(0, 1)
+        # Add monitoring metrics (detached, won't affect gradients)
+        losses['dz_mean'] = deltas[..., 2].detach().mean()
+        losses['dz_max'] = deltas[..., 2].detach().abs().max()
+        losses['opacity'] = opacities.detach().mean()
+        losses['rd_mean'] = rendered_depth.detach().mean()
 
-        # Resize depth to match rendered_depth shape
-        if depth.shape[-2:] != rendered_depth.shape[-2:]:
-            depth = F.interpolate(
-                depth.unsqueeze(1),
+        # Position loss: directly supervise Gaussian depth positions
+        # This prevents opacity cheating when using RGB+ED mode
+        # adjusted_depth: [B, N, Q, 1] - Gaussian's actual depth = sample_depth * (1 + delta_z)
+        # sample_depth: [B, N, Q, 1] - GT depth at reference points
+        valid_position = sample_depth > 0
+        if valid_position.sum() > 0:
+            losses['loss_position'] = F.l1_loss(
+                adjusted_depth[valid_position],
+                sample_depth[valid_position]
+            ) * self.position_loss_weight
+        else:
+            losses['loss_position'] = torch.tensor(0.0, device=adjusted_depth.device)
+
+        # Depth loss - depth is [B, N, H, W], flatten to [B*N, H, W] to match rendered_depth
+        depth_for_loss = depth.flatten(0, 1)
+
+        # Resize depth to match rendered_depth shape if needed
+        if depth_for_loss.shape[-2:] != rendered_depth.shape[-2:]:
+            depth_for_loss = F.interpolate(
+                depth_for_loss.unsqueeze(1),
                 size=rendered_depth.shape[-2:], mode='nearest'
             ).squeeze(1)
 
-        # Create sky mask to ignore sky pixels (class 17) in depth loss
+        # Create sky mask to exclude sky pixels (PriorDA has sky depth but it's not reliable)
+        # SAM3 class 17 = sky
         sky_mask = None
         if sem_segs is not None:
-            # Resize sem_segs to match rendered depth size
             sky_mask = F.interpolate(
                 sem_segs.flatten(0, 1).unsqueeze(1).float(),
                 size=rendered_depth.shape[-2:], mode='nearest'
             ).squeeze(1).long()
             sky_mask = (sky_mask != 17)  # True for non-sky pixels
 
-        losses['loss_depth'] = self.depth_loss(rendered_depth, depth, mask=sky_mask)
-        losses['mae_depth'] = self.depth_loss(
-            rendered_depth, depth, criterion='l1', mask=sky_mask)
+        # Compute depth loss with sky mask
+        losses['loss_depth'] = self.depth_loss(rendered_depth, depth_for_loss, sky_mask=sky_mask)
+        losses['mae_depth'] = self.depth_loss(rendered_depth, depth_for_loss, criterion='l1', sky_mask=sky_mask)
 
         # Feature loss
         bsn, c, h, w = rendered.shape
-        # Get actual feature spatial dimensions from the original feats tensor
-        # feats: [B, N, C, H_feat, W_feat]
         feat_h = feats.shape[-2]
         feat_w = feats.shape[-1]
         tgt_feats = tgt_feats.mT.reshape(bsn, c, feat_h, feat_w)
@@ -426,29 +472,37 @@ class GaussTRHead(nn.Module):
         rendered = rendered.flatten(2).mT
         tgt_feats = tgt_feats.flatten(2).mT.flatten(0, 1)
 
-        # === COMMENTED OUT: Visual cosine loss ===
-        # losses['loss_cosine'] = F.cosine_embedding_loss(
-        #     rendered.flatten(0, 1), tgt_feats,
-        #     torch.ones_like(tgt_feats[:, 0])) * self.cosine_loss_weight
+        # Cosine loss for feature alignment (original weight: 5)
+        losses['loss_cosine'] = F.cosine_embedding_loss(
+            rendered.flatten(0, 1), tgt_feats,
+            torch.ones_like(tgt_feats[:, 0])) * 5
 
-        # Text-guided contrastive loss (uses SAM3-aligned text embeddings)
-        if sem_segs is not None and self.text_proto_embeds_sam3 is not None:
-            # Project text embeddings through same PCA as features
-            # text_proto_embeds_sam3: [feat_dims, 17] -> PCA -> [reduce_dims, 17]
-            text_embeds_pca = self.text_proto_embeds_sam3.T @ v  # [17, reduce_dims]
-            text_embeds_pca = text_embeds_pca.T  # [reduce_dims, 17]
-
+        # Segmentation loss
+        if sem_segs is not None:
             # Resize sem_segs to match rendered size
             sem_segs_resized = F.interpolate(
                 sem_segs.flatten(0, 1).unsqueeze(1).float(),
                 size=(h, w), mode='nearest'
             ).squeeze(1).long()
+            # Map sky (class 17) to 0, which will be ignored by ignore_index=0
+            sem_segs_clamped = torch.where(
+                sem_segs_resized == 17,
+                torch.zeros_like(sem_segs_resized),
+                sem_segs_resized
+            )
+            losses['loss_ce'] = F.cross_entropy(
+                self.class_head(rendered).mT,
+                sem_segs_clamped.flatten(1).long(),
+                ignore_index=0)
 
-            losses['loss_text'] = self.text_contrastive_loss(
-                rendered_2d, sem_segs_resized, text_embeds_pca
-            ) * self.text_loss_weight
-
-        # Segmentation loss disabled - using text contrastive loss instead
+            # Text-guided contrastive loss (additional, uses SAM3-aligned text embeddings)
+            if self.text_proto_embeds_sam3 is not None:
+                # Project text embeddings through same PCA as features
+                text_embeds_pca = self.text_proto_embeds_sam3.T @ v  # [17, reduce_dims]
+                text_embeds_pca = text_embeds_pca.T  # [reduce_dims, 17]
+                losses['loss_text'] = self.text_contrastive_loss(
+                    rendered_2d, sem_segs_resized, text_embeds_pca
+                ) * self.text_loss_weight
 
         return losses
 
@@ -457,23 +511,25 @@ class GaussTRHead(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         criterion: str = 'silog_l1',
-        mask: Optional[torch.Tensor] = None
+        sky_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Compute depth loss with optional sky mask."""
+        # Apply sky mask if provided
+        if sky_mask is not None:
+            pred = pred[sky_mask]
+            target = target[sky_mask]
+
         loss = 0
         if 'silog' in criterion:
-            loss += self.silog_loss(pred, target, mask=mask)
+            loss += self.silog_loss(pred, target)
         if 'l1' in criterion:
-            valid = target > 0
-            if mask is not None:
-                valid = valid & mask  # Also exclude sky pixels
             target_flat = target.flatten()
-            pred_flat = pred.flatten()
-            valid_flat = valid.flatten()
-            l1_loss = F.l1_loss(pred_flat[valid_flat], target_flat[valid_flat])
-            if loss != 0:
-                l1_loss *= 0.2
-            loss += l1_loss
+            valid = target_flat > 0
+            if valid.sum() > 0:
+                l1_loss = F.l1_loss(pred.flatten()[valid], target_flat[valid])
+                if loss != 0:
+                    l1_loss *= 0.2
+                loss += l1_loss
         return loss
 
     def scale_transform(
