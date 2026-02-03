@@ -402,6 +402,11 @@ def main(cfg: DictConfig) -> None:
 
     # Build trainer
     trainer_cfg = OmegaConf.to_container(cfg.get('trainer', {}), resolve=True)
+    has_gt = cfg.get('data', {}).get('has_gt', True)
+
+    # Skip validation entirely if no GT available
+    limit_val_batches = 0 if not has_gt else trainer_cfg.get('limit_val_batches', 1.0)
+    num_sanity_val_steps = 0 if not has_gt else trainer_cfg.get('num_sanity_val_steps', 2)
 
     trainer = pl.Trainer(
         max_epochs=trainer_cfg.get('max_epochs', 24),
@@ -416,13 +421,14 @@ def main(cfg: DictConfig) -> None:
         accumulate_grad_batches=trainer_cfg.get('accumulate_grad_batches', 1),
         val_check_interval=trainer_cfg.get('val_check_interval', 1.0),
         check_val_every_n_epoch=trainer_cfg.get('check_val_every_n_epoch', 1),
+        limit_val_batches=limit_val_batches,
         log_every_n_steps=trainer_cfg.get('log_every_n_steps', 50),
         enable_progress_bar=True,
         enable_model_summary=True,
         deterministic=trainer_cfg.get('deterministic', False),
         benchmark=trainer_cfg.get('benchmark', True),
         sync_batchnorm=trainer_cfg.get('sync_batchnorm', False),
-        num_sanity_val_steps=trainer_cfg.get('num_sanity_val_steps', 2),
+        num_sanity_val_steps=num_sanity_val_steps,
     )
 
     # Train

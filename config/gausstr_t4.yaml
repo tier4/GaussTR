@@ -23,7 +23,7 @@ early_stopping: false
 test_after_training: true
 
 model:
-  num_queries: 300
+  num_queries: 7200  # 4x increase for better coverage (1800 * 4)
   embed_dims: 256
   feat_dims: 768  # DINOv3CLIP features are 768-dim
 
@@ -38,14 +38,18 @@ model:
   decoder_num_levels: 4
 
   head_reduce_dims: 128
-  head_image_shape: [496, 768]  # H, W for T4 (aspect ratio ~1.55:1)
-  head_render_image_size: [496, 768]
+  head_image_shape: [896, 1392]  # H, W to match DINOv3CLIP dino_min=896
+  head_render_image_size: [1860, 2880]  # Original image resolution (used with img_aug_mat)
   head_patch_size: 14  # DINOv3 uses 14x14 patches
-  head_depth_limit: 80.0
+  head_depth_limit: 101.0  # 16-bit/650 scale max = 65535/650 = 100.82m
   head_text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"  # 768-dim for DINOv3CLIP
   head_text_protos_sam3: "ckpts/text_proto_embeds_dinov3clip_sam3.pth"  # SAM3-aligned for training
   head_prompt_denoising: true
   head_num_segment_classes: 17  # SAM3 has 17 classes (0-16)
+  # Original loss weights (hardcoded): loss_depth: 1.0, loss_cosine: 5.0, loss_ce: 1.0
+  head_text_loss_weight: 3.0  # Additional text contrastive loss weight
+  head_position_loss_weight: 1.0  # Position loss to prevent opacity cheating with RGB+ED
+  head_pca_path: "ckpts/t4_pca_front_wide.pth"  # Pre-computed PCA for single-view stability
 
   vol_range: [-40, -40, -1, 40, 40, 5.4]
   voxel_size: 0.4
@@ -53,11 +57,18 @@ model:
   opacity_thresh: 0.0
   sigma_factor: 3.0
 
-  learning_rate: 0.0004  # 2x for 2x batch size (linear scaling)
-  weight_decay: 0.005
-  warmup_iters: 150  # Adjusted for batch size
+  # Optimizer settings
+  optimizer: "adamw"  # "adamw" (default), "lion" (faster), or "adam8bit" (memory efficient)
+  learning_rate: 0.0001  # Scaled for smaller batch size (was 2e-4 @ bs=4)
+  weight_decay: 0.005  # For Lion: use 0.01-0.05 (3-10x higher)
+  betas: [0.9, 0.95]  # [0.9, 0.95] recommended for transformers (default [0.9, 0.999])
+
+  # LR schedule settings
+  warmup_iters: 250  # Scaled with batch size
   warmup_factor: 0.001
-  lr_milestones: [16]
+  lr_schedule: "cosine"  # "cosine" (recommended), "onecycle", or "multistep"
+  min_lr_ratio: 0.01  # Final LR = learning_rate * min_lr_ratio
+  lr_milestones: [16]  # Only used if lr_schedule="multistep"
   lr_gamma: 0.1
   gradient_clip_val: 35.0
 
@@ -71,30 +82,29 @@ data:
   data_root: "/mnt/nvme2/T4_datasets"
   train_ann_file: "/mnt/nvme2/T4_processed/t4_infos_train.pkl"
   val_ann_file: "/mnt/nvme2/T4_processed/t4_infos_val.pkl"
-  # T4 images are 2880x1860, target: 768x496 -> resize factor ~0.267
-  input_size: [496, 768]  # H, W
-  resize_lim: [0.267, 0.267]
-  # Feature paths on nvme3
-  depth_root: "/mnt/nvme3/T4_datasets_lidar_depth_interp"
+  # T4 images are 2880x1860, target: 1392x896 -> resize factor ~0.4833
+  input_size: [896, 1392]  # H, W
+  resize_lim: [0.4833, 0.4833]
+  fixed_resize_min_side: 896  # Match dinov3clip keep_aspect_min_side_round16
+  fixed_resize_round: 16
+  # Feature paths
+  depth_root: "/mnt/nvme1/data/T4_datasets_priorda_depth"  # Dense depth from Prior-Depth-Anything
+  depth_png_format: true  # Depth stored as 16-bit PNG
+  depth_scale: 650  # Scale factor: depth_meters = uint16_value / 650
   feats_root: "/mnt/nvme3/T4_datasets_dinov3clip"
   sem_seg_root: "/mnt/nvme3/T4_datasets_sam3"  # SAM3 segmentation masks (PNG)
-  batch_size: 4
+  batch_size: 2
   num_workers: 6
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
   dataset_type: "t4"
-  num_views: 6
+  num_views: 1
   use_camera_subdirs: false  # Not using per-camera subdirs directly
   use_chunk_subdirs: true  # Using {chunk_name}/{camera} structure
   sam3_png_format: true  # SAM3 masks are PNG files, not numpy
   has_gt: false
   camera_names:
-    - "CAM_FRONT"
-    - "CAM_FRONT_LEFT_WIDE"
-    - "CAM_FRONT_RIGHT_WIDE"
-    - "CAM_BACK_LEFT_WIDE"
-    - "CAM_BACK_RIGHT_WIDE"
     - "CAM_FRONT_WIDE"
 
 trainer:
