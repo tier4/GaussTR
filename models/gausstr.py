@@ -56,6 +56,10 @@ class GaussTRLightning(pl.LightningModule):
         head_text_loss_weight: float = 3.0,  # Weight for text contrastive loss
         head_text_loss_temp: float = 0.1,  # Temperature for text contrastive loss
         head_cosine_loss_weight: float = 2.0,  # Weight for visual cosine loss
+        head_depth_loss_weight: float = 1.0,  # Weight for depth loss
+        head_position_loss_weight: float = 1.0,  # Weight for position loss (prevents opacity cheating)
+        head_depth_warmup_iters: int = 0,  # Warmup steps to ramp depth loss weight
+        head_pca_path: Optional[str] = None,  # Pre-computed PCA for single-view datasets
         # Voxelizer config (defaults match original GaussTR)
         vol_range: List[float] = None,
         voxel_size: float = 0.4,
@@ -63,10 +67,14 @@ class GaussTRLightning(pl.LightningModule):
         opacity_thresh: float = 0.0,
         sigma_factor: float = 3.0,
         # Training config
+        optimizer: str = "adamw",  # "adamw", "lion", or "adam8bit"
         learning_rate: float = 2e-4,
         weight_decay: float = 5e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),  # Adam betas
         warmup_iters: int = 200,
         warmup_factor: float = 1e-3,
+        lr_schedule: str = "cosine",  # "cosine", "onecycle", or "multistep"
+        min_lr_ratio: float = 0.01,  # Final LR = learning_rate * min_lr_ratio
         lr_milestones: List[int] = None,
         lr_gamma: float = 0.1,
         steps_per_epoch: int = None,  # Auto-calculated from dataloader if not specified
@@ -155,6 +163,9 @@ class GaussTRLightning(pl.LightningModule):
             'text_loss_weight': head_text_loss_weight,
             'text_loss_temp': head_text_loss_temp,
             'cosine_loss_weight': head_cosine_loss_weight,
+            'depth_loss_weight': head_depth_loss_weight,
+            'position_loss_weight': head_position_loss_weight,
+            'pca_path': head_pca_path,
             'voxelizer_cfg': {
                 'vol_range': vol_range,
                 'voxel_size': voxel_size,
@@ -176,13 +187,15 @@ class GaussTRLightning(pl.LightningModule):
     def _forward_features(
         self,
         feats: torch.Tensor,
-        batch_size: int
+        batch_size: int,
+        sem_segs: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """Shared feature extraction through neck and decoder.
 
         Args:
             feats: Pre-extracted features [B, N, C, H, W].
             batch_size: Batch size.
+            sem_segs: Semantic segmentation masks [B, N, H, W] for sky filtering.
 
         Returns:
             Dictionary with hidden_states and references from decoder.
@@ -196,7 +209,7 @@ class GaussTRLightning(pl.LightningModule):
         # Prepare decoder inputs
         decoder_inputs = self.pre_transformer(multi_scale_feats)
         feat_flatten = flatten_multi_scale_feats(multi_scale_feats)[0]
-        decoder_inputs.update(self.pre_decoder(feat_flatten, batch_size))
+        decoder_inputs.update(self.pre_decoder(feat_flatten, batch_size, sem_segs=sem_segs))
 
         # Forward through decoder
         return self.forward_decoder(
@@ -282,8 +295,8 @@ class GaussTRLightning(pl.LightningModule):
 
         bs, n = images.shape[:2]
 
-        # Forward through neck and decoder
-        decoder_outputs = self._forward_features(feats, bs)
+        # Forward through neck and decoder (pass sem_segs for sky-aware reference point init)
+        decoder_outputs = self._forward_features(feats, bs, sem_segs=sem_segs)
         query = decoder_outputs['hidden_states']
         reference_points = decoder_outputs['references']
 
@@ -300,11 +313,15 @@ class GaussTRLightning(pl.LightningModule):
                 feats=feats,
                 img_aug_mat=img_aug_mat,
                 sem_segs=sem_segs,
+                layer_idx=i,
+                debug_step=(self.global_step == 0 and batch_idx == 0),
                 mode='loss'
             )
             for k, v in layer_losses.items():
                 losses[f'{k}/{i}'] = v
-                total_loss += v
+                # Only add actual losses to total, not monitoring metrics
+                if k.startswith('loss_'):
+                    total_loss += v
 
         # Log losses
         self.log_dict(losses, prog_bar=True, sync_dist=True, batch_size=bs)
@@ -470,11 +487,50 @@ class GaussTRLightning(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizers and schedulers."""
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay
-        )
+        optimizer_type = getattr(self.hparams, 'optimizer', 'adamw').lower()
+        betas = getattr(self.hparams, 'betas', (0.9, 0.999))
+
+        if optimizer_type == 'lion':
+            # Lion optimizer (Google 2023) - faster convergence, lower memory
+            # Recommended: lr 3-10x lower than AdamW, weight_decay 3-10x higher
+            try:
+                from lion_pytorch import Lion
+                optimizer = Lion(
+                    self.parameters(),
+                    lr=self.learning_rate,
+                    weight_decay=self.weight_decay,
+                    betas=(betas[0], 0.99),  # Lion uses different beta2
+                )
+                print(f"Using Lion optimizer (lr={self.learning_rate}, wd={self.weight_decay})")
+            except ImportError:
+                print("lion-pytorch not installed, falling back to AdamW. Install: pip install lion-pytorch")
+                optimizer = torch.optim.AdamW(
+                    self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay, betas=betas
+                )
+        elif optimizer_type == 'adam8bit':
+            # 8-bit Adam for memory efficiency (~50% less optimizer memory)
+            try:
+                import bitsandbytes as bnb
+                optimizer = bnb.optim.AdamW8bit(
+                    self.parameters(),
+                    lr=self.learning_rate,
+                    weight_decay=self.weight_decay,
+                    betas=betas,
+                )
+                print(f"Using 8-bit AdamW (lr={self.learning_rate})")
+            except ImportError:
+                print("bitsandbytes not installed, falling back to AdamW. Install: pip install bitsandbytes")
+                optimizer = torch.optim.AdamW(
+                    self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay, betas=betas
+                )
+        else:
+            # Default: AdamW
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                betas=betas,
+            )
 
         # Auto-calculate steps_per_epoch from trainer if not specified
         if self._steps_per_epoch is not None:
@@ -484,20 +540,55 @@ class GaussTRLightning(pl.LightningModule):
             steps_per_epoch = self.trainer.estimated_stepping_batches // self.trainer.max_epochs
             print(f"Auto-calculated steps_per_epoch: {steps_per_epoch}")
 
-        # Warmup + MultiStepLR scheduler (matches original MMEngine config)
-        # - LinearLR warmup: start_factor=1e-3, end=200 steps
-        # - MultiStepLR decay: milestones=[16] epochs, gamma=0.1
-        def lr_lambda(step):
-            if step < self.warmup_iters:
-                # Linear warmup
-                return self.warmup_factor + (1 - self.warmup_factor) * step / self.warmup_iters
-            else:
-                # MultiStepLR decay (convert epoch milestones to steps)
-                decay = 1.0
-                for milestone in self.lr_milestones:
-                    if step >= milestone * steps_per_epoch:
-                        decay *= self.lr_gamma
-                return decay
+        total_steps = steps_per_epoch * self.trainer.max_epochs
+        lr_schedule = getattr(self.hparams, 'lr_schedule', 'cosine')
+        min_lr_ratio = getattr(self.hparams, 'min_lr_ratio', 0.01)  # Configurable min LR
+
+        if lr_schedule == 'cosine':
+            # Cosine Annealing with Warmup
+            # - Linear warmup for warmup_iters steps
+            # - Cosine decay to min_lr after warmup
+            import math
+
+            def lr_lambda(step):
+                if step < self.warmup_iters:
+                    # Linear warmup
+                    return self.warmup_factor + (1 - self.warmup_factor) * step / self.warmup_iters
+                else:
+                    # Cosine annealing
+                    progress = (step - self.warmup_iters) / max(1, total_steps - self.warmup_iters)
+                    return min_lr_ratio + 0.5 * (1 - min_lr_ratio) * (1 + math.cos(math.pi * progress))
+
+        elif lr_schedule == 'onecycle':
+            # OneCycleLR - fast convergence, good for limited epochs
+            # Ramps up to max_lr then down, with momentum annealing
+            import math
+            pct_start = self.warmup_iters / total_steps  # Warmup portion
+
+            def lr_lambda(step):
+                pct = step / total_steps
+                if pct < pct_start:
+                    # Warmup phase: ramp up
+                    return self.warmup_factor + (1 - self.warmup_factor) * (pct / pct_start)
+                else:
+                    # Annealing phase: cosine down to min_lr
+                    progress = (pct - pct_start) / (1 - pct_start)
+                    return min_lr_ratio + 0.5 * (1 - min_lr_ratio) * (1 + math.cos(math.pi * progress))
+        else:
+            # MultiStepLR scheduler (original MMEngine config)
+            # - Linear warmup for warmup_iters steps
+            # - Step decay at milestones
+            def lr_lambda(step):
+                if step < self.warmup_iters:
+                    # Linear warmup
+                    return self.warmup_factor + (1 - self.warmup_factor) * step / self.warmup_iters
+                else:
+                    # MultiStepLR decay (convert epoch milestones to steps)
+                    decay = 1.0
+                    for milestone in self.lr_milestones:
+                        if step >= milestone * steps_per_epoch:
+                            decay *= self.lr_gamma
+                    return decay
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -555,13 +646,16 @@ class GaussTRLightning(pl.LightningModule):
     def pre_decoder(
         self,
         memory: torch.Tensor,
-        batch_size: int
+        batch_size: int,
+        sem_segs: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """Prepare query embeddings and reference points.
 
         Args:
             memory: Encoder memory [B*N, L, C].
             batch_size: Batch size.
+            sem_segs: Semantic segmentation masks [B, N, H, W] for sky filtering.
+                      If provided, reference points will be sampled from non-sky regions.
 
         Returns:
             Dictionary with query and reference points.
@@ -570,7 +664,50 @@ class GaussTRLightning(pl.LightningModule):
         c = memory.size(-1)
 
         query = self.query_embeds.weight.unsqueeze(0).expand(bs, -1, -1)
-        reference_points = torch.rand((bs, query.size(1), 2), device=query.device)
+        num_queries = query.size(1)
+
+        # Sample reference points, avoiding sky regions if sem_segs provided
+        if sem_segs is not None:
+            # sem_segs: [B, N, H, W] -> flatten to [B*N, H, W]
+            sem_segs_flat = sem_segs.flatten(0, 1)
+            h, w = sem_segs_flat.shape[-2:]
+
+            reference_points = []
+            for i in range(bs):
+                # Create mask of valid (non-sky) pixels
+                # Sky class is 17 in SAM3
+                valid_mask = (sem_segs_flat[i] != 17)
+                valid_indices = valid_mask.nonzero(as_tuple=False)  # [num_valid, 2] (row, col)
+
+                if len(valid_indices) >= num_queries:
+                    # Sample from valid regions
+                    perm = torch.randperm(len(valid_indices), device=memory.device)[:num_queries]
+                    sampled_indices = valid_indices[perm]  # [num_queries, 2]
+                    # Convert to normalized coordinates [0, 1]
+                    # Reference points are (x, y) = (col/w, row/h)
+                    ref_pts = torch.stack([
+                        sampled_indices[:, 1].float() / w,  # x = col / width
+                        sampled_indices[:, 0].float() / h,  # y = row / height
+                    ], dim=-1)
+                else:
+                    # Not enough valid pixels, fall back to random sampling
+                    # but bias toward valid regions
+                    ref_pts = torch.rand((num_queries, 2), device=memory.device)
+                    if len(valid_indices) > 0:
+                        # Replace first len(valid_indices) points with valid ones
+                        perm = torch.randperm(len(valid_indices), device=memory.device)
+                        sampled_indices = valid_indices[perm]
+                        ref_pts[:len(valid_indices)] = torch.stack([
+                            sampled_indices[:, 1].float() / w,
+                            sampled_indices[:, 0].float() / h,
+                        ], dim=-1)
+
+                reference_points.append(ref_pts)
+
+            reference_points = torch.stack(reference_points)  # [B*N, num_queries, 2]
+        else:
+            # Fallback to uniform random sampling
+            reference_points = torch.rand((bs, num_queries, 2), device=query.device)
 
         return {
             'query': query,
