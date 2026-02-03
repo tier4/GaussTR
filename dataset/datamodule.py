@@ -55,6 +55,10 @@ class GaussTRDataModule(pl.LightningDataModule):
         use_camera_subdirs: bool = False,
         use_chunk_subdirs: bool = False,
         sam3_png_format: bool = False,
+        depth_png_format: bool = False,
+        depth_scale: Optional[float] = None,
+        fixed_resize_min_side: Optional[int] = None,
+        fixed_resize_round: int = 16,
         has_gt: Optional[bool] = None,
         batch_size: int = 2,
         num_workers: int = 4,
@@ -79,6 +83,10 @@ class GaussTRDataModule(pl.LightningDataModule):
         self.use_camera_subdirs = use_camera_subdirs
         self.use_chunk_subdirs = use_chunk_subdirs
         self.sam3_png_format = sam3_png_format
+        self.depth_png_format = depth_png_format
+        self.depth_scale = depth_scale
+        self.fixed_resize_min_side = fixed_resize_min_side
+        self.fixed_resize_round = fixed_resize_round
         self.has_gt = has_gt if has_gt is not None else self.dataset_type != 't4'
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -109,6 +117,10 @@ class GaussTRDataModule(pl.LightningDataModule):
                 use_camera_subdirs=self.use_camera_subdirs,
                 use_chunk_subdirs=self.use_chunk_subdirs,
                 sam3_png_format=self.sam3_png_format,
+                depth_png_format=self.depth_png_format,
+                depth_scale=self.depth_scale,
+                fixed_resize_min_side=self.fixed_resize_min_side,
+                fixed_resize_round=self.fixed_resize_round,
             )
 
             self.train_dataset = self._build_dataset(
@@ -117,8 +129,9 @@ class GaussTRDataModule(pl.LightningDataModule):
                 test_mode=False,
             )
 
-        if stage in ('fit', 'validate') or stage is None:
+        if (stage in ('fit', 'validate') or stage is None) and self.has_gt:
             # Validation transforms (deterministic, no random augmentation)
+            # Only create validation dataset if GT is available
             val_transforms = get_val_transforms(
                 input_size=self.input_size,
                 resize_lim=self.resize_lim,
@@ -130,6 +143,10 @@ class GaussTRDataModule(pl.LightningDataModule):
                 use_camera_subdirs=self.use_camera_subdirs,
                 use_chunk_subdirs=self.use_chunk_subdirs,
                 sam3_png_format=self.sam3_png_format,
+                depth_png_format=self.depth_png_format,
+                depth_scale=self.depth_scale,
+                fixed_resize_min_side=self.fixed_resize_min_side,
+                fixed_resize_round=self.fixed_resize_round,
                 load_gt=self.has_gt,
             )
 
@@ -152,6 +169,10 @@ class GaussTRDataModule(pl.LightningDataModule):
                 use_camera_subdirs=self.use_camera_subdirs,
                 use_chunk_subdirs=self.use_chunk_subdirs,
                 sam3_png_format=self.sam3_png_format,
+                depth_png_format=self.depth_png_format,
+                depth_scale=self.depth_scale,
+                fixed_resize_min_side=self.fixed_resize_min_side,
+                fixed_resize_round=self.fixed_resize_round,
                 load_gt=self.has_gt,
             )
 
@@ -198,10 +219,16 @@ class GaussTRDataModule(pl.LightningDataModule):
             drop_last=True,
         )
 
-    def val_dataloader(self) -> DataLoader:
-        """Create validation dataloader."""
+    def val_dataloader(self) -> Optional[DataLoader]:
+        """Create validation dataloader.
+
+        Returns train dataloader if has_gt is False (validation will be skipped
+        via limit_val_batches=0 in Trainer).
+        """
+        # Use train dataset as fallback when no validation data
+        dataset = self.val_dataset if self.has_gt else self.train_dataset
         return DataLoader(
-            self.val_dataset,
+            dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
@@ -271,6 +298,10 @@ class GaussTRDataModuleFromConfig(GaussTRDataModule):
             use_camera_subdirs=getattr(data_cfg, 'use_camera_subdirs', False),
             use_chunk_subdirs=getattr(data_cfg, 'use_chunk_subdirs', False),
             sam3_png_format=getattr(data_cfg, 'sam3_png_format', False),
+            depth_png_format=getattr(data_cfg, 'depth_png_format', False),
+            depth_scale=getattr(data_cfg, 'depth_scale', None),
+            fixed_resize_min_side=getattr(data_cfg, 'fixed_resize_min_side', None),
+            fixed_resize_round=getattr(data_cfg, 'fixed_resize_round', 16),
             has_gt=getattr(data_cfg, 'has_gt', None),
             batch_size=data_cfg.batch_size,
             num_workers=data_cfg.num_workers,

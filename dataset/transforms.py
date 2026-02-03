@@ -111,6 +111,9 @@ class ImageAug3D:
         rot_lim: Range for rotation in degrees.
         rand_flip: Whether to apply random horizontal flip.
         is_train: Whether in training mode.
+        fixed_resize_min_side: If set, resize so the shorter side equals this value,
+            then round H/W up to a multiple of fixed_resize_round. Disables crop/flip/rotate.
+        fixed_resize_round: Round resized H/W up to this multiple when fixed_resize_min_side is set.
     """
 
     def __init__(
@@ -120,7 +123,9 @@ class ImageAug3D:
         bot_pct_lim: Tuple[float, float] = (0.0, 0.0),
         rot_lim: Tuple[float, float] = (0.0, 0.0),
         rand_flip: bool = False,
-        is_train: bool = False
+        is_train: bool = False,
+        fixed_resize_min_side: Optional[int] = None,
+        fixed_resize_round: int = 16
     ):
         self.final_dim = final_dim
         self.resize_lim = resize_lim
@@ -128,13 +133,29 @@ class ImageAug3D:
         self.rand_flip = rand_flip
         self.rot_lim = rot_lim
         self.is_train = is_train
+        self.fixed_resize_min_side = fixed_resize_min_side
+        self.fixed_resize_round = fixed_resize_round
 
     def sample_augmentation(self, results: Dict) -> Tuple:
         """Sample augmentation parameters."""
         H, W = results['ori_shape']
         fH, fW = self.final_dim
 
-        if self.is_train:
+        if self.fixed_resize_min_side is not None:
+            # Match dinov3clip keep_aspect_min_side_round16: resize only, no crop/flip/rotate
+            resize = float(self.fixed_resize_min_side) / float(min(H, W))
+            newW = int(round(W * resize))
+            newH = int(round(H * resize))
+            round_to = max(1, int(self.fixed_resize_round))
+            newH = ((newH + round_to - 1) // round_to) * round_to
+            newW = ((newW + round_to - 1) // round_to) * round_to
+            resize_dims = (newW, newH)
+            # Use anisotropic scales to reflect rounded dimensions exactly
+            resize = (newW / float(W), newH / float(H))
+            crop = (0, 0, newW, newH)
+            flip = False
+            rotate = 0.0
+        elif self.is_train:
             resize = np.random.uniform(*self.resize_lim)
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
@@ -160,7 +181,7 @@ class ImageAug3D:
         img: np.ndarray,
         rotation: torch.Tensor,
         translation: torch.Tensor,
-        resize: float,
+        resize: Any,
         resize_dims: Tuple[int, int],
         crop: Tuple[int, int, int, int],
         flip: bool,
@@ -187,8 +208,13 @@ class ImageAug3D:
             img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
-        # Update transformation matrix
-        rotation = rotation * resize
+        # Update transformation matrix (support anisotropic resize)
+        if isinstance(resize, (tuple, list, np.ndarray)):
+            scale_x, scale_y = float(resize[0]), float(resize[1])
+            scale = torch.tensor([[scale_x, 0.0], [0.0, scale_y]], dtype=torch.float32)
+            rotation = rotation @ scale
+        else:
+            rotation = rotation * resize
         translation = translation - torch.tensor(crop[:2], dtype=torch.float32)
 
         if flip:
@@ -265,11 +291,25 @@ def _load_sparse_depth(path: str) -> np.ndarray:
     return depth
 
 
-def _load_png_as_array(path: str) -> np.ndarray:
-    """Load PNG image as numpy array (for SAM3 segmentation masks)."""
+def _load_png_as_array(path: str, depth_scale: float = None) -> np.ndarray:
+    """Load PNG image as numpy array.
+
+    Args:
+        path: Path to PNG file.
+        depth_scale: If provided and image is uint16, convert to float32 depth in meters
+                     by dividing by this scale (e.g., 650 for 1.54mm precision, max 100m).
+
+    Returns:
+        numpy array - uint8/int64 for segmentation masks, float32 for depth maps.
+    """
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f"Failed to load PNG: {path}")
+
+    # Handle 16-bit depth PNGs (e.g., from Prior-Depth-Anything)
+    if img.dtype == np.uint16 and depth_scale is not None:
+        return img.astype(np.float32) / depth_scale
+
     return img
 
 
@@ -285,6 +325,8 @@ class LoadFeatMaps:
         use_camera_subdirs: If True, load from per-camera subdirectories.
         use_chunk_subdirs: If True, load from {chunk_name}/{camera} subdirectories (T4 format).
         png_format: If True, load PNG files instead of numpy (for SAM3 segmentation masks).
+        depth_scale: Scale factor for 16-bit depth PNGs (e.g., 650 for Prior-Depth-Anything).
+                     If provided, uint16 PNGs are converted to float32 meters.
 
     Note:
         File format is auto-detected based on extension (.npy, .npz, or .png).
@@ -299,7 +341,8 @@ class LoadFeatMaps:
         use_mmap: bool = False,
         use_camera_subdirs: bool = False,
         use_chunk_subdirs: bool = False,
-        png_format: bool = False
+        png_format: bool = False,
+        depth_scale: float = None
     ):
         self.data_root = data_root
         self.key = key
@@ -309,6 +352,7 @@ class LoadFeatMaps:
         self.use_camera_subdirs = use_camera_subdirs
         self.use_chunk_subdirs = use_chunk_subdirs
         self.png_format = png_format
+        self.depth_scale = depth_scale
 
     def __call__(self, results: Dict) -> Dict:
         """Load feature maps for all views."""
@@ -342,7 +386,7 @@ class LoadFeatMaps:
             # Auto-detect file format based on extension
             if self.png_format:
                 feat_path = base_path + '.png'
-                feat = _load_png_as_array(feat_path)
+                feat = _load_png_as_array(feat_path, depth_scale=self.depth_scale)
             elif os.path.exists(base_path + '.npy'):
                 feat_path = base_path + '.npy'
                 if self.use_mmap:
@@ -362,8 +406,9 @@ class LoadFeatMaps:
             # Skip for PNG segmentation masks which are uint8 class labels
             if feat.dtype == np.int8:
                 feat = feat.astype(np.float32) / 127.0
-            elif self.png_format:
+            elif self.png_format and feat.dtype != np.float32:
                 # PNG segmentation masks - keep as integer class labels
+                # (depth PNGs with depth_scale are already float32)
                 feat = feat.astype(np.int64)
 
             feat = torch.from_numpy(feat)
@@ -374,14 +419,19 @@ class LoadFeatMaps:
                 post_tran = img_aug_mats[i][:3, 3]
 
                 h, w = feat.shape[-2:]
-                # Use nearest neighbor for segmentation masks (PNG format or integer dtype)
-                # For depth maps, bilinear is fine since dense depth has no zeros to interpolate with
-                is_segmentation = self.png_format or feat.dtype in [torch.long, torch.int, torch.int64, torch.int32]
-                mode = 'nearest' if is_segmentation else 'bilinear'
 
                 # Resize
                 new_h = int(h * post_rot[1, 1] + 0.5)
                 new_w = int(w * post_rot[0, 0] + 0.5)
+
+                # Use nearest neighbor for segmentation masks; depth should stay continuous
+                int_types = (torch.long, torch.int, torch.int64, torch.int32)
+                is_segmentation = (self.png_format and self.key in ("sem_seg", "sem_segs")) or feat.dtype in int_types
+                if is_segmentation:
+                    mode = 'nearest'
+                else:
+                    # Prefer area for downsampling (anti-aliasing), bilinear for upsampling
+                    mode = 'area' if (new_h < h or new_w < w) else 'bilinear'
 
                 if feat.dim() == 2:
                     feat = feat.unsqueeze(0).unsqueeze(0)
@@ -482,6 +532,10 @@ def get_train_transforms(
     use_camera_subdirs: bool = False,
     use_chunk_subdirs: bool = False,
     sam3_png_format: bool = False,
+    depth_png_format: bool = False,
+    depth_scale: Optional[float] = None,
+    fixed_resize_min_side: Optional[int] = None,
+    fixed_resize_round: int = 16,
 ) -> Compose:
     """Get training transforms.
 
@@ -496,6 +550,11 @@ def get_train_transforms(
         use_camera_subdirs: Whether to load depth/features from per-camera subdirs.
         use_chunk_subdirs: Whether to use {chunk_name}/{camera} subdirs (T4 format).
         sam3_png_format: Whether SAM3 segmentation masks are PNG files.
+        depth_png_format: Whether depth maps are stored as 16-bit PNG files.
+        depth_scale: Scale factor for 16-bit depth PNGs (e.g., 650 for Prior-Depth-Anything).
+        fixed_resize_min_side: If set, resize so the shorter side equals this value and round
+            H/W to a multiple of fixed_resize_round. Disables crop/flip/rotate.
+        fixed_resize_round: Round resized H/W up to this multiple when fixed_resize_min_side is set.
 
     Returns:
         Composed transforms.
@@ -505,7 +564,9 @@ def get_train_transforms(
         ImageAug3D(
             final_dim=input_size,
             resize_lim=resize_lim,
-            is_train=True
+            is_train=True,
+            fixed_resize_min_side=fixed_resize_min_side,
+            fixed_resize_round=fixed_resize_round,
         ),
         LoadFeatMaps(
             data_root=depth_root,
@@ -513,6 +574,8 @@ def get_train_transforms(
             apply_aug=True,
             use_camera_subdirs=use_camera_subdirs,
             use_chunk_subdirs=use_chunk_subdirs,
+            png_format=depth_png_format,
+            depth_scale=depth_scale,
         ),
         LoadFeatMaps(
             data_root=feats_root,
@@ -550,6 +613,10 @@ def get_val_transforms(
     use_camera_subdirs: bool = False,
     use_chunk_subdirs: bool = False,
     sam3_png_format: bool = False,
+    depth_png_format: bool = False,
+    depth_scale: Optional[float] = None,
+    fixed_resize_min_side: Optional[int] = None,
+    fixed_resize_round: int = 16,
     load_gt: bool = True
 ) -> Compose:
     """Get validation transforms.
@@ -565,6 +632,11 @@ def get_val_transforms(
         use_camera_subdirs: Whether to load depth/features from per-camera subdirs.
         use_chunk_subdirs: Whether to use {chunk_name}/{camera} subdirs (T4 format).
         sam3_png_format: Whether SAM3 segmentation masks are PNG files.
+        depth_png_format: Whether depth maps are stored as 16-bit PNG files.
+        depth_scale: Scale factor for 16-bit depth PNGs (e.g., 650 for Prior-Depth-Anything).
+        fixed_resize_min_side: If set, resize so the shorter side equals this value and round
+            H/W to a multiple of fixed_resize_round. Disables crop/flip/rotate.
+        fixed_resize_round: Round resized H/W up to this multiple when fixed_resize_min_side is set.
         load_gt: Whether to load occupancy ground truth.
 
     Returns:
@@ -581,7 +653,9 @@ def get_val_transforms(
         ImageAug3D(
             final_dim=input_size,
             resize_lim=resize_lim,
-            is_train=False
+            is_train=False,
+            fixed_resize_min_side=fixed_resize_min_side,
+            fixed_resize_round=fixed_resize_round,
         ),
         LoadFeatMaps(
             data_root=depth_root,
@@ -589,6 +663,8 @@ def get_val_transforms(
             apply_aug=True,
             use_camera_subdirs=use_camera_subdirs,
             use_chunk_subdirs=use_chunk_subdirs,
+            png_format=depth_png_format,
+            depth_scale=depth_scale,
         ),
         LoadFeatMaps(
             data_root=feats_root,
