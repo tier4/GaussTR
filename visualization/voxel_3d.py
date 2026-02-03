@@ -69,9 +69,9 @@ def render_occupancy_pytorch(
     points_t = torch.from_numpy(points).to(device)
     labels_t = torch.from_numpy(labels).long().to(device)
 
-    # Camera parameters (bird's eye view with angle)
-    eye = torch.tensor([-50.0, -50.0, 50.0], device=device)
-    center = torch.tensor([0.0, 0.0, 2.0], device=device)
+    # Camera parameters - focus on front area up to +100m
+    eye = torch.tensor([-40.0, 0.0, 60.0], device=device)
+    center = torch.tensor([40.0, 0.0, 2.0], device=device)
     up = torch.tensor([0.0, 0.0, 1.0], device=device)
 
     # Compute view matrix
@@ -133,9 +133,10 @@ def render_occupancy_pytorch(
     labels_clamped = torch.clamp(labels_valid, 0, len(colors) - 1)
     point_colors = colors[labels_clamped]
 
-    # Draw larger points for better visibility
-    for dy in range(-1, 2):
-        for dx in range(-1, 2):
+    # Draw larger points for better visibility (scale with image size)
+    point_radius = max(3, min(width, height) // 300)
+    for dy in range(-point_radius, point_radius + 1):
+        for dx in range(-point_radius, point_radius + 1):
             y_draw = torch.clamp(y_pix + dy, 0, height - 1)
             x_draw = torch.clamp(x_pix + dx, 0, width - 1)
             img[y_draw, x_draw] = point_colors

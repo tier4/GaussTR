@@ -181,13 +181,19 @@ def create_t4_composite_visualization(
 
     canvas = np.ones((out_h, out_w, 3), dtype=np.uint8) * 255
 
+    # Standard size for individual images before concatenation
+    std_h, std_w = 900, 1600
+
     # Front row (no flipping)
     front_images = []
     for cam in T4_FRONT_VIEW_ORDER:
         if cam in images:
             img = images[cam]
+            # Resize to standard size if needed
+            if img.shape[:2] != (std_h, std_w):
+                img = cv2.resize(img, (std_w, std_h), interpolation=cv2.INTER_LINEAR)
         else:
-            img = np.zeros((900, 1600, 3), dtype=np.uint8)
+            img = np.zeros((std_h, std_w, 3), dtype=np.uint8)
         front_images.append(img)
     front_row = np.concatenate(front_images, axis=1)
     front_row = cv2.resize(front_row, (cam_w, cam_h), interpolation=cv2.INTER_LINEAR)
@@ -198,10 +204,13 @@ def create_t4_composite_visualization(
     for cam in T4_BACK_VIEW_ORDER:
         if cam in images:
             img = images[cam]
+            # Resize to standard size if needed
+            if img.shape[:2] != (std_h, std_w):
+                img = cv2.resize(img, (std_w, std_h), interpolation=cv2.INTER_LINEAR)
             if cam.startswith('CAM_BACK'):
                 img = np.flip(img, axis=1).copy()
         else:
-            img = np.zeros((900, 1600, 3), dtype=np.uint8)
+            img = np.zeros((std_h, std_w, 3), dtype=np.uint8)
         back_images.append(img)
 
     back_row = np.concatenate(back_images, axis=1)
