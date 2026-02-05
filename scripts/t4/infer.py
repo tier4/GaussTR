@@ -254,10 +254,12 @@ def parse_args():
                         help='Device to run inference on')
     parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'],
                         help='Dataset split to use (default: val)')
+    parser.add_argument('overrides', nargs='*', default=[],
+                        help='Config overrides in key=value format (e.g., data.depth_root=/path)')
     return parser.parse_args()
 
 
-def load_model_and_config(checkpoint_path: str, config_path: str = None, device: str = 'cuda:0'):
+def load_model_and_config(checkpoint_path: str, config_path: str = None, device: str = 'cuda:0', overrides: list = None):
     """Load model from checkpoint and config."""
     from models import GaussTRLightning
 
@@ -271,6 +273,14 @@ def load_model_and_config(checkpoint_path: str, config_path: str = None, device:
 
     print(f"Loading config from: {config_path}")
     cfg = OmegaConf.load(config_path)
+
+    # Apply overrides
+    if overrides:
+        for override in overrides:
+            if '=' in override:
+                key, value = override.split('=', 1)
+                OmegaConf.update(cfg, key, value)
+                print(f"  Override: {key}={value}")
 
     # Build model config
     model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
