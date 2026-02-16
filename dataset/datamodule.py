@@ -10,8 +10,12 @@ from torch.utils.data import DataLoader
 
 from .dataset import NuScenesOccDataset, NuScenesOccDatasetV2
 from .t4_dataset import T4Dataset
-from .transforms import get_train_transforms, get_val_transforms, Compose
-from .collate import collate_gausstr
+from .transforms import (
+    get_train_transforms, get_val_transforms,
+    get_pgocc_train_transforms, get_pgocc_val_transforms,
+    Compose,
+)
+from .collate import collate_gausstr, collate_pgocc
 
 
 class GaussTRDataModule(pl.LightningDataModule):
@@ -65,6 +69,11 @@ class GaussTRDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         persistent_workers: bool = True,
         prefetch_factor: int = 3,
+        # PG-Occ specific
+        model_type: str = 'gausstr',
+        render_h: int = 180,
+        render_w: int = 320,
+        num_sweeps: int = 7,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -93,10 +102,20 @@ class GaussTRDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
+        self.model_type = (model_type or 'gausstr').lower()
+        self.render_h = render_h
+        self.render_w = render_w
+        self.num_sweeps = num_sweeps
 
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+
+    def _get_collate_fn(self):
+        """Return the appropriate collate function."""
+        if self.model_type == 'pgocc':
+            return collate_pgocc
+        return collate_gausstr
 
     def setup(self, stage: Optional[str] = None):
         """Set up datasets for each stage.
@@ -104,6 +123,10 @@ class GaussTRDataModule(pl.LightningDataModule):
         Args:
             stage: Current stage ('fit', 'validate', 'test', or None for all).
         """
+        if self.model_type == 'pgocc':
+            self._setup_pgocc(stage)
+            return
+
         if stage == 'fit' or stage is None:
             # Training transforms with augmentation
             train_transforms = get_train_transforms(
@@ -182,6 +205,44 @@ class GaussTRDataModule(pl.LightningDataModule):
                 test_mode=True,
             )
 
+    def _setup_pgocc(self, stage):
+        """Set up PG-Occ specific datasets with temporal sweep support."""
+        pgocc_kwargs = dict(
+            data_root=self.data_root,
+            depth_root=self.depth_root,
+            feats_root=self.feats_root,
+            input_size=self.input_size,
+            render_h=self.render_h,
+            render_w=self.render_w,
+            num_sweeps=self.num_sweeps,
+            num_cams=self.num_views,
+            num_views=self.num_views,
+        )
+
+        if stage == 'fit' or stage is None:
+            train_transforms = get_pgocc_train_transforms(**pgocc_kwargs)
+            self.train_dataset = self._build_dataset(
+                ann_file=self.train_ann_file,
+                transforms=train_transforms,
+                test_mode=False,
+            )
+
+        if (stage in ('fit', 'validate') or stage is None) and self.has_gt:
+            val_transforms = get_pgocc_val_transforms(**pgocc_kwargs)
+            self.val_dataset = self._build_dataset(
+                ann_file=self.val_ann_file,
+                transforms=val_transforms,
+                test_mode=False,
+            )
+
+        if stage == 'test':
+            val_transforms = get_pgocc_val_transforms(**pgocc_kwargs)
+            self.test_dataset = self._build_dataset(
+                ann_file=self.val_ann_file,
+                transforms=val_transforms,
+                test_mode=True,
+            )
+
     def _build_dataset(
         self,
         ann_file: str,
@@ -212,7 +273,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=collate_gausstr,
+            collate_fn=self._get_collate_fn(),
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,
@@ -232,7 +293,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_gausstr,
+            collate_fn=self._get_collate_fn(),
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,
@@ -247,7 +308,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_gausstr,
+            collate_fn=self._get_collate_fn(),
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             prefetch_factor=self.prefetch_factor,

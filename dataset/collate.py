@@ -163,6 +163,50 @@ def collate_with_padding(
     return collated
 
 
+def collate_pgocc(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Custom collate function for PG-Occ data.
+
+    Handles batching of:
+    - img: [B, T*N, C, H, W] multi-frame multi-view images
+    - depth: [B, N, 1, Hd, Wd] foundation depth maps
+    - text_vision: [B, N, C, Hf, Wf] DINOv3CLIP features
+    - render_gt: [B, T*N, Rh, Rw, 3] render targets
+    - t0_2_x_geo: [B, (T-1)*N, 4, 4] ego-to-ego transforms
+    - img_metas: list of dicts (one per batch item)
+
+    Args:
+        batch: List of sample dictionaries from PackPGOccInputs.
+
+    Returns:
+        Batched dictionary.
+    """
+    if len(batch) == 0:
+        return {}
+
+    # Keys that should be stacked into tensors
+    tensor_keys = {'img', 'depth', 'text_vision', 'render_gt', 't0_2_x_geo'}
+
+    collated = {}
+
+    for key in batch[0].keys():
+        if key == 'img_metas':
+            # img_metas stays as a list of dicts
+            collated['img_metas'] = [sample['img_metas'] for sample in batch]
+            continue
+
+        values = [sample[key] for sample in batch if key in sample]
+        if len(values) == 0:
+            continue
+
+        if key in tensor_keys:
+            collated[key] = _stack_tensors(values)
+        else:
+            # Metadata: keep as list
+            collated[key] = values
+
+    return collated
+
+
 def _pad_and_stack(
     values: List[Any],
     pad_value: float = 0.0,

@@ -1,0 +1,132 @@
+# PG-Occ T4 Configuration
+# Progressive Gaussian Occupancy with ResNet50+FPN backbone, 5 cameras, 8 temporal frames
+
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: work_dirs/${experiment_name}/${run_name}_${now:%Y%m%d_%H%M%S}
+  sweep:
+    dir: work_dirs/${experiment_name}
+    subdir: ${run_name}_${now:%Y%m%d_%H%M%S}
+  output_subdir: .hydra
+
+seed: 42
+work_dir: work_dirs/${experiment_name}
+logger: "mlflow"
+experiment_name: "pgocc_t4"
+run_name: null
+mlflow_tracking_uri: "sqlite:///mlruns/mlflow.db"
+mlflow_artifact_location: "mlruns/artifacts"
+use_rich_progress: true
+early_stopping: false
+test_after_training: false
+
+model:
+  # Backbone
+  frozen_stages: 1
+  backbone_pretrained: ""  # Will fall back to ImageNet pretrained
+
+  # Architecture (PG-Occ original params)
+  embed_dims: 256
+  num_queries: [4000, 1000, 1000]  # Progressive: coarse, medium, fine
+  num_frames: 8  # 1 current + 7 sweeps
+  num_points: 4
+  num_groups: 4
+  num_levels: 4
+  num_cams: 5
+
+  # Range
+  pc_range: [-40, -40, -1, 40, 40, 5.4]
+  occ_size: [200, 200, 16]
+  voxel_size: 0.4
+
+  # Rendering
+  render_h: 180
+  render_w: 320
+  use_ov: true
+  ov_dim: 768  # DINOv3CLIP dimension
+
+  # Losses
+  loss_weights:
+    depth_warping: 10.0
+    ov_mse: 10.0
+    ov_cos: 1.0
+    depth_foundation: 0.5
+
+  # Evaluation
+  density_threshold: 0.04
+  text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"
+
+  # Voxelizer (reuse GaussTR's CUDA voxelizer)
+  vol_range: [-40.4, -40.4, -1.4, 39.6, 39.6, 5.0]
+  filter_gaussians: true
+  opacity_thresh: 0.6
+  sigma_factor: 3.0
+
+  # Optimizer
+  learning_rate: 2e-4
+  weight_decay: 0.01
+  backbone_lr_mult: 0.1
+  warmup_iters: 500
+  lr_schedule: "cosine"
+  min_lr_ratio: 0.001
+
+  # Augmentation
+  use_grid_mask: false
+  img_color_aug: true
+  size_divisor: 32
+  mean: [123.675, 116.28, 103.53]
+  std: [58.395, 57.12, 57.375]
+
+data:
+  data_root: "/mnt/nvme2/T4_datasets"
+  train_ann_file: "/mnt/nvme2/T4_processed/t4_infos_train_sweep.pkl"
+  val_ann_file: "/mnt/nvme2/T4_processed/t4_infos_val_sweep.pkl"
+  depth_root: "/mnt/nvme1/data/T4_datasets_priorda_depth"
+  feats_root: "/mnt/nvme3/T4_datasets_dinov3clip"
+
+  # Image resolution
+  input_size: [256, 704]  # H, W (PG-Occ default)
+  render_h: 180
+  render_w: 320
+
+  # Temporal
+  num_sweeps: 7  # + current = 8 frames total
+
+  # Dataset
+  dataset_type: "t4"
+  model_type: "pgocc"
+  num_views: 5
+  has_gt: false
+  camera_names:
+    - "CAM_FRONT_WIDE"
+    - "CAM_FRONT_LEFT_WIDE"
+    - "CAM_FRONT_RIGHT_WIDE"
+    - "CAM_BACK_LEFT_WIDE"
+    - "CAM_BACK_RIGHT_WIDE"
+
+  batch_size: 1
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+trainer:
+  max_epochs: 8
+  accelerator: "gpu"
+  devices: 8
+  strategy: "ddp_find_unused_parameters_true"
+  precision: "16-mixed"
+  gradient_clip_val: 350.0
+  gradient_clip_algorithm: "norm"
+  accumulate_grad_batches: 1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  limit_val_batches: 0
+  log_every_n_steps: 50
+  deterministic: false
+  benchmark: true
+  sync_batchnorm: false
+  num_sanity_val_steps: 0

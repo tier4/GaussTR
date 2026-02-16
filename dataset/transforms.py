@@ -689,3 +689,299 @@ def get_val_transforms(
     transforms.append(PackInputs())
 
     return Compose(transforms)
+
+
+# === PG-Occ transforms ===
+
+
+class LoadMultiSweepImages:
+    """Load temporal sweep images and compute ego motion transforms.
+
+    Loads images from past frames (stored in annotation 'sweeps' field),
+    computes ego-to-image projections for all frames, and ego-to-ego
+    transforms for temporal depth warping.
+
+    Args:
+        num_sweeps: Number of past sweep frames to load.
+        num_cams: Number of cameras.
+        render_h: Render target height.
+        render_w: Render target width.
+        data_root: Root directory for T4 data.
+    """
+
+    def __init__(self, num_sweeps=7, num_cams=5, render_h=180, render_w=320, data_root=''):
+        self.num_sweeps = num_sweeps
+        self.num_cams = num_cams
+        self.render_h = render_h
+        self.render_w = render_w
+        self.data_root = data_root
+
+    def __call__(self, results):
+        N = self.num_cams
+        cam_names = list(results['images'].keys())[:N]
+        sweeps = results.get('sweeps', [])
+
+        # Current frame ego2global and cam2ego per camera
+        cur_ego2global = []
+        cur_cam2ego = []
+        cur_cam2img = []
+        for cam_name in cam_names:
+            cam = results['images'][cam_name]
+            cur_ego2global.append(np.array(cam['ego2global'], dtype=np.float32))
+            cur_cam2ego.append(np.array(cam['cam2ego'], dtype=np.float32))
+            c2i_3x3 = np.array(cam['cam2img'], dtype=np.float32)
+            c2i = np.eye(4, dtype=np.float32)
+            c2i[:3, :3] = c2i_3x3 if c2i_3x3.shape == (3, 3) else c2i_3x3[:3, :3]
+            cur_cam2img.append(c2i)
+
+        cur_ego2global = np.stack(cur_ego2global)  # [N, 4, 4]
+        cur_cam2ego = np.stack(cur_cam2ego)  # [N, 4, 4]
+        cur_cam2img = np.stack(cur_cam2img)  # [N, 4, 4]
+
+        # Compute ego2img for current frame: cam2img @ inv(cam2ego)
+        ego2img_list = []
+        for n in range(N):
+            ego2cam = np.linalg.inv(cur_cam2ego[n])
+            ego2img_list.append(cur_cam2img[n] @ ego2cam)
+
+        # Store render_k (intrinsics) and cam2ego for gsplat rendering
+        results['render_k'] = cur_cam2img.copy()
+
+        # Load sweep images and compute transforms
+        sweep_imgs = []
+        t0_2_x_geo = []  # [num_sweeps*N, 4, 4]
+
+        actual_sweeps = min(len(sweeps), self.num_sweeps)
+        for s_idx in range(actual_sweeps):
+            sweep = sweeps[s_idx]
+            for cam_name in cam_names:
+                if cam_name not in sweep['images']:
+                    continue
+                s_cam = sweep['images'][cam_name]
+
+                # Load sweep image
+                img_path = s_cam['img_path']
+                if not os.path.isabs(img_path) and self.data_root:
+                    img_path = os.path.join(self.data_root, img_path)
+                img = cv2.imread(img_path)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+                    sweep_imgs.append(img)
+                else:
+                    h, w = results['img'][0].shape[:2]
+                    sweep_imgs.append(np.zeros((h, w, 3), dtype=np.float32))
+
+                # ego2img for sweep frame
+                s_c2i_3x3 = np.array(s_cam['cam2img'], dtype=np.float32)
+                s_c2i = np.eye(4, dtype=np.float32)
+                s_c2i[:3, :3] = s_c2i_3x3 if s_c2i_3x3.shape == (3, 3) else s_c2i_3x3[:3, :3]
+                s_cam2ego = np.array(s_cam['cam2ego'], dtype=np.float32)
+                s_ego2cam = np.linalg.inv(s_cam2ego)
+                ego2img_list.append(s_c2i @ s_ego2cam)
+
+            # Compute t0_2_x_geo: current cam -> past cam transform per camera
+            for n, cam_name in enumerate(cam_names):
+                if cam_name not in sweep['images']:
+                    continue
+                s_cam = sweep['images'][cam_name]
+                s_ego2global = np.array(s_cam['ego2global'], dtype=np.float32)
+                s_cam2ego = np.array(s_cam['cam2ego'], dtype=np.float32)
+
+                # T = inv(s_cam2ego) @ inv(s_ego2global) @ cur_ego2global[n] @ cur_cam2ego[n]
+                T = (np.linalg.inv(s_cam2ego) @
+                     np.linalg.inv(s_ego2global) @
+                     cur_ego2global[n] @
+                     cur_cam2ego[n])
+                t0_2_x_geo.append(T)
+
+        # Pad if fewer sweeps than requested
+        while len(sweep_imgs) < self.num_sweeps * N:
+            pad_idx = len(sweep_imgs) % N
+            sweep_imgs.append(results['img'][pad_idx].copy())
+        while len(t0_2_x_geo) < self.num_sweeps * N:
+            t0_2_x_geo.append(np.eye(4, dtype=np.float32))
+        while len(ego2img_list) < (1 + self.num_sweeps) * N:
+            ego2img_list.append(np.eye(4, dtype=np.float32))
+
+        # Generate render_gt: all images at render resolution [T*N, Rh, Rw, 3]
+        render_gt_imgs = []
+        all_imgs = list(results['img'][:N]) + sweep_imgs[:self.num_sweeps * N]
+        for img in all_imgs:
+            img_u8 = img.astype(np.uint8) if img.max() > 1.0 else (img * 255).astype(np.uint8)
+            resized = cv2.resize(img_u8, (self.render_w, self.render_h),
+                                 interpolation=cv2.INTER_LINEAR)
+            render_gt_imgs.append(resized.astype(np.float32))
+
+        # Append sweep images to results (img now has T*N images)
+        results['img'] = list(results['img'][:N]) + sweep_imgs[:self.num_sweeps * N]
+
+        # Store computed arrays
+        results['ego2img'] = np.stack(ego2img_list[:(1 + self.num_sweeps) * N])
+        results['t0_2_x_geo'] = np.stack(t0_2_x_geo[:self.num_sweeps * N])
+        results['render_gt'] = np.stack(render_gt_imgs)
+        results['cam2ego'] = cur_cam2ego  # [N, 4, 4] current frame only
+
+        return results
+
+
+class ResizePGOccImages:
+    """Resize images to target resolution for PG-Occ.
+
+    Simple resize without crop/flip/rotate. PG-Occ handles normalization
+    and augmentation in the model's extract_feat.
+
+    Args:
+        target_size: Target (H, W) for backbone input.
+    """
+
+    def __init__(self, target_size=(256, 704)):
+        self.target_h, self.target_w = target_size
+
+    def __call__(self, results):
+        resized = []
+        for img in results['img']:
+            if img.shape[:2] != (self.target_h, self.target_w):
+                img_u8 = img.astype(np.uint8) if img.max() > 1.0 else (img * 255).astype(np.uint8)
+                img = cv2.resize(img_u8, (self.target_w, self.target_h),
+                                 interpolation=cv2.INTER_LINEAR).astype(np.float32)
+            resized.append(img)
+        results['img'] = resized
+        results['img_shape'] = (self.target_h, self.target_w)
+        return results
+
+
+class PackPGOccInputs:
+    """Pack PG-Occ inputs into tensor format for the model.
+
+    Produces the batch dict expected by PGOccLightning:
+    - img: [T*N, 3, H, W] images
+    - depth: [N, 1, Hd, Wd] foundation depth
+    - text_vision: [N, C, Hf, Wf] DINOv3CLIP features
+    - render_gt: [T*N, Rh, Rw, 3] render targets
+    - t0_2_x_geo: [(T-1)*N, 4, 4] ego-to-ego transforms
+    - img_metas: dict with ego2img, cam2ego, render_k
+    """
+
+    def __init__(self, num_cams=5, render_h=180, render_w=320):
+        self.num_cams = num_cams
+        self.render_h = render_h
+        self.render_w = render_w
+
+    def __call__(self, results):
+        packed = {}
+
+        # Images: [T*N, H, W, C] -> [T*N, C, H, W]
+        imgs = np.stack(results['img'], axis=0)
+        packed['img'] = torch.from_numpy(imgs).permute(0, 3, 1, 2)
+
+        # Foundation depth: resize to render resolution for BackprojectDepth
+        if 'depth' in results:
+            depth = results['depth']
+            if isinstance(depth, torch.Tensor):
+                if depth.dim() == 3:
+                    depth = depth.unsqueeze(1)
+            elif isinstance(depth, np.ndarray):
+                depth = torch.from_numpy(depth)
+                if depth.dim() == 3:
+                    depth = depth.unsqueeze(1)
+            # Resize to render resolution: [N, 1, Hd, Wd] -> [N, 1, render_h, render_w]
+            if depth.shape[-2] != self.render_h or depth.shape[-1] != self.render_w:
+                depth = F.interpolate(
+                    depth.float(),
+                    size=(self.render_h, self.render_w),
+                    mode='nearest',
+                )
+            packed['depth'] = depth
+
+        # DINOv3CLIP features
+        if 'feats' in results:
+            packed['text_vision'] = results['feats']
+
+        # Render targets
+        if 'render_gt' in results:
+            packed['render_gt'] = torch.from_numpy(results['render_gt'])
+
+        # Ego-to-ego transforms
+        if 't0_2_x_geo' in results:
+            packed['t0_2_x_geo'] = torch.from_numpy(results['t0_2_x_geo']).float()
+
+        # Image metadata
+        img_metas = {}
+        for key in ['ego2img', 'cam2ego', 'render_k']:
+            if key in results:
+                val = results[key]
+                if isinstance(val, np.ndarray):
+                    img_metas[key] = torch.from_numpy(val).float()
+                elif isinstance(val, torch.Tensor):
+                    img_metas[key] = val.float()
+
+        # Shape info needed by pad_multiple
+        num_cams = self.num_cams
+        if 'img' in packed:
+            _, C, H, W = packed['img'].shape
+            img_metas['ori_shape'] = [(H, W, C)] * num_cams
+            img_metas['img_shape'] = [(H, W, C)] * num_cams
+
+        packed['img_metas'] = img_metas
+
+        for key in ['token', 'scene_token', 'timestamp', 'sample_idx']:
+            if key in results:
+                packed[key] = results[key]
+
+        return packed
+
+
+def get_pgocc_train_transforms(
+    data_root='/mnt/nvme2/T4_datasets',
+    depth_root='/mnt/nvme1/data/T4_datasets_priorda_depth',
+    feats_root='/mnt/nvme3/T4_datasets_dinov3clip',
+    input_size=(256, 704),
+    render_h=180,
+    render_w=320,
+    num_sweeps=7,
+    num_cams=5,
+    num_views=5,
+):
+    """Get PG-Occ training transforms."""
+    return Compose([
+        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root),
+        LoadMultiSweepImages(
+            num_sweeps=num_sweeps, num_cams=num_cams,
+            render_h=render_h, render_w=render_w, data_root=data_root),
+        ResizePGOccImages(target_size=input_size),
+        LoadFeatMaps(
+            data_root=depth_root, key='depth', apply_aug=False,
+            use_chunk_subdirs=True, png_format=True, depth_scale=650.0),
+        LoadFeatMaps(
+            data_root=feats_root, key='feats', apply_aug=False,
+            use_chunk_subdirs=True),
+        PackPGOccInputs(num_cams=num_cams, render_h=render_h, render_w=render_w),
+    ])
+
+
+def get_pgocc_val_transforms(
+    data_root='/mnt/nvme2/T4_datasets',
+    depth_root='/mnt/nvme1/data/T4_datasets_priorda_depth',
+    feats_root='/mnt/nvme3/T4_datasets_dinov3clip',
+    input_size=(256, 704),
+    render_h=180,
+    render_w=320,
+    num_sweeps=7,
+    num_cams=5,
+    num_views=5,
+):
+    """Get PG-Occ validation transforms (same pipeline, no random aug)."""
+    return Compose([
+        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root),
+        LoadMultiSweepImages(
+            num_sweeps=num_sweeps, num_cams=num_cams,
+            render_h=render_h, render_w=render_w, data_root=data_root),
+        ResizePGOccImages(target_size=input_size),
+        LoadFeatMaps(
+            data_root=depth_root, key='depth', apply_aug=False,
+            use_chunk_subdirs=True, png_format=True, depth_scale=650.0),
+        LoadFeatMaps(
+            data_root=feats_root, key='feats', apply_aug=False,
+            use_chunk_subdirs=True),
+        PackPGOccInputs(num_cams=num_cams, render_h=render_h, render_w=render_w),
+    ])
