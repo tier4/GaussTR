@@ -177,37 +177,30 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, ego2img, image_h, imag
     sample_points_cam = sample_points_cam.permute(0, 1, 3, 2, 4, 5, 6)
     sample_points_cam = sample_points_cam.reshape(B * T * G, Q, P, 3)
 
-    # Don't expand by G for sampling — handle groups via channel split after
-    scale_weights_flat = scale_weights.reshape(B, Q, G, T, P, -1)
-    # Average scale weights across groups for sampling (groups are channel-split, not spatial)
-    scale_weights_avg = scale_weights_flat.mean(dim=2)  # [B, Q, T, P, L]
-    scale_weights_avg = scale_weights_avg.permute(0, 2, 1, 3, 4)  # [B, T, Q, P, L]
-    scale_weights_avg = scale_weights_avg.reshape(B * T, Q, P, -1)
+    # Keep per-group scale weights (matches original SparseBEV behavior).
+    scale_weights = scale_weights.reshape(B, Q, G, T, P, -1)
+    scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
+    scale_weights = scale_weights.reshape(B * G * T, Q, P, -1)
 
-    # Reformat sample_points: [B, T, Q, G, P, 1, 3] -> [B*T, Q, P, 3]
-    # Need to re-derive from the sample_points_cam which is [B*T*G, Q, P, 3]
-    # Since all G groups sample same points, take every G-th element
-    sample_points_flat = sample_points_cam.reshape(B, T, G, Q, P, 3)[:, :, 0]  # [B, T, Q, P, 3]
-    sample_points_flat = sample_points_flat.reshape(B * T, Q, P, 3)
-
-    # Reformat mlvl_feats from [B, T*N, C, H, W] to [B*T, N, H, W, C]
+    # Reformat features to group-split layout:
+    # [B, T*N, C, H, W] -> [B*T*G, N, H, W, C//G]
     reformatted_feats = []
     for feat in mlvl_feats:
-        f = feat.reshape(B, T, N, *feat.shape[2:])  # [B, T, N, C, H, W]
-        f = f.reshape(B * T, N, *feat.shape[2:])  # [B*T, N, C, H, W]
-        f = f.permute(0, 1, 3, 4, 2)  # [B*T, N, H, W, C]
+        _, tn, c, h, w = feat.shape
+        assert tn == T * N, f"Expected TN={T*N}, got {tn}"
+        assert c % G == 0, f"Channel dim {c} must be divisible by num_groups {G}"
+        cg = c // G
+        f = feat.reshape(B, T, N, G, cg, h, w)
+        f = f.permute(0, 1, 3, 2, 5, 6, 4)  # [B, T, G, N, H, W, Cg]
+        f = f.reshape(B * T * G, N, h, w, cg).contiguous()
         reformatted_feats.append(f)
 
-    final = msmv_sampling_pytorch(reformatted_feats, sample_points_flat, scale_weights_avg)
-    # final: [B*T, Q, C, P]
+    final = msmv_sampling_pytorch(reformatted_feats, sample_points_cam, scale_weights)
+    # final: [B*T*G, Q, Cg, P]
 
     C = final.shape[2]
-    Cg = C // G
-    final = final.reshape(B, T, Q, C, P)
-    # Split channels into groups: [B, T, Q, G, C//G, P]
-    final = final.reshape(B, T, Q, G, Cg, P)
-    # Rearrange to [B, Q, G, T*P, C//G]
-    final = final.permute(0, 2, 3, 1, 5, 4)  # [B, Q, G, T, P, Cg]
-    final = final.flatten(3, 4)  # [B, Q, G, T*P, Cg]
+    final = final.reshape(B, T, G, Q, C, P)
+    final = final.permute(0, 3, 2, 1, 5, 4)  # [B, Q, G, T, P, C]
+    final = final.flatten(3, 4)  # [B, Q, G, T*P, C]
 
     return final

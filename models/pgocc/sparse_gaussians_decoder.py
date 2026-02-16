@@ -130,10 +130,14 @@ class SparseGaussiansDecoder(nn.Module):
             gau_xyz_sigmoid[..., 1] * self.unit_sigmoid[1],
             gau_xyz_sigmoid[..., 2] * self.unit_sigmoid[2],
         ], dim=-1)
+        gau_xyz_delta = torch.nan_to_num(gau_xyz_delta, nan=0.0)
 
         gau_rots = F.normalize(gau_pred[..., 3:7], dim=-1)
+        gau_rots = torch.nan_to_num(gau_rots, nan=0.0)
         gau_scales = torch.sigmoid(gau_pred[..., 7:10]) * (scale_range[1] - scale_range[0]) + scale_range[0]
+        gau_scales = torch.nan_to_num(gau_scales, nan=scale_range[0])
         gau_opacities = torch.sigmoid(gau_pred[..., 10:11]).squeeze(-1)
+        gau_opacities = torch.nan_to_num(gau_opacities, nan=0.5)
 
         return dict(
             delta_xyz=gau_xyz_delta,
@@ -152,9 +156,8 @@ class SparseGaussiansDecoder(nn.Module):
         # --- Depth-guided query initialization via FPS ---
         if depth is not None:
             depth = depth[0]  # [N, 1, H, W]
-            depth = depth.squeeze(1)  # [N, H, W]
             depth = depth.clamp(max=51.2)
-            mask = (depth > 0) & (depth < 80)
+            mask = ((depth > 0) & (depth < 80)).squeeze(1)
 
             render_k, cam2ego, W2C = prepare_gs_attribute(img_metas, num_cams=N)
             inv_k = torch.inverse(render_k)
@@ -267,8 +270,6 @@ class SparseGaussiansDecoder(nn.Module):
             query_feat_part = layer(query_feat_part, query_bbox, mlvl_feats, anisotropy_info, img_metas)
 
             gau_pred = self.gau_pred_heads[i](query_feat_part)
-
-            # --- Apply Gaussian prediction with progressive refinement ---
             all_scales, all_rots, all_opacities = [], [], []
 
             if i == 0:
@@ -279,31 +280,53 @@ class SparseGaussiansDecoder(nn.Module):
                 all_opacities.append(gaussian['gau_opacities'])
             elif i == 1:
                 gaussian = self.query_2_gaussian(gau_pred[:, :q0], scale_range=(0.0, 6.4))
-                query_coord[:, :q0] = gaussian['delta_xyz'] + query_coord[:, :q0]
+                query_coord[:, :q0] = (
+                    gaussian['delta_xyz'] + query_coord[:, :q0]
+                )
                 all_scales.append(gaussian['gau_scales'])
                 all_rots.append(gaussian['gau_rots'])
                 all_opacities.append(gaussian['gau_opacities'])
 
-                gaussian_medium = self.query_2_gaussian(gau_pred[:, q0:q0 + q1], scale_range=(0.0, 6.4))
-                query_coord[:, q0:q0 + q1] = gaussian_medium['delta_xyz'] / 2 + query_coord[:, q0:q0 + q1]
+                gaussian_medium = self.query_2_gaussian(
+                    gau_pred[:, q0:q0 + q1],
+                    scale_range=(0.0, 6.4),
+                )
+                query_coord[:, q0:q0 + q1] = (
+                    gaussian_medium['delta_xyz'] / 2
+                    + query_coord[:, q0:q0 + q1]
+                )
                 all_scales.append(gaussian_medium['gau_scales'])
                 all_rots.append(gaussian_medium['gau_rots'])
                 all_opacities.append(gaussian_medium['gau_opacities'])
             elif i == 2:
                 gaussian = self.query_2_gaussian(gau_pred[:, :q0], scale_range=(0.0, 6.4))
-                query_coord[:, :q0] = gaussian['delta_xyz'] + query_coord[:, :q0]
+                query_coord[:, :q0] = (
+                    gaussian['delta_xyz'] + query_coord[:, :q0]
+                )
                 all_scales.append(gaussian['gau_scales'])
                 all_rots.append(gaussian['gau_rots'])
                 all_opacities.append(gaussian['gau_opacities'])
 
-                gaussian_medium = self.query_2_gaussian(gau_pred[:, q0:q0 + q1], scale_range=(0.0, 6.4))
-                query_coord[:, q0:q0 + q1] = gaussian_medium['delta_xyz'] / 2 + query_coord[:, q0:q0 + q1]
+                gaussian_medium = self.query_2_gaussian(
+                    gau_pred[:, q0:q0 + q1],
+                    scale_range=(0.0, 6.4),
+                )
+                query_coord[:, q0:q0 + q1] = (
+                    gaussian_medium['delta_xyz'] / 2
+                    + query_coord[:, q0:q0 + q1]
+                )
                 all_scales.append(gaussian_medium['gau_scales'])
                 all_rots.append(gaussian_medium['gau_rots'])
                 all_opacities.append(gaussian_medium['gau_opacities'])
 
-                gaussian_fine = self.query_2_gaussian(gau_pred[:, q0 + q1:], scale_range=(0.0, 6.4))
-                query_coord[:, q0 + q1:] = gaussian_fine['delta_xyz'] / 4 + query_coord[:, q0 + q1:]
+                gaussian_fine = self.query_2_gaussian(
+                    gau_pred[:, q0 + q1:],
+                    scale_range=(0.0, 6.4),
+                )
+                query_coord[:, q0 + q1:] = (
+                    gaussian_fine['delta_xyz'] / 4
+                    + query_coord[:, q0 + q1:]
+                )
                 all_scales.append(gaussian_fine['gau_scales'])
                 all_rots.append(gaussian_fine['gau_rots'])
                 all_opacities.append(gaussian_fine['gau_opacities'])

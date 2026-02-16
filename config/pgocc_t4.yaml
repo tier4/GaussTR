@@ -69,7 +69,9 @@ model:
   learning_rate: 2e-4
   weight_decay: 0.01
   backbone_lr_mult: 0.1
+  sampling_offset_lr_mult: 0.1
   warmup_iters: 500
+  warmup_factor: 0.3333333333
   lr_schedule: "cosine"
   min_lr_ratio: 0.001
 
@@ -102,8 +104,8 @@ data:
   has_gt: false
   camera_names:
     - "CAM_FRONT_WIDE"
-    - "CAM_FRONT_LEFT_WIDE"
     - "CAM_FRONT_RIGHT_WIDE"
+    - "CAM_FRONT_LEFT_WIDE"
     - "CAM_BACK_LEFT_WIDE"
     - "CAM_BACK_RIGHT_WIDE"
 

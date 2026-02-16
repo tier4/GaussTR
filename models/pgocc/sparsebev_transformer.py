@@ -79,7 +79,8 @@ class SparseBEVSelfAttention(nn.Module):
             attn_mask = None
 
         out, _ = self.attention(query_feat, query_feat, query_feat, attn_mask=attn_mask)
-        return out
+        # mmcv MultiheadAttention returns identity + out (proj_drop=0, dropout_layer=0)
+        return query_feat + out
 
     def forward(self, query_bbox, query_feat, pre_attn_mask=None):
         if self.training and query_feat.requires_grad:

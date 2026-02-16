@@ -34,12 +34,20 @@ class LoadMultiViewImages:
         to_float32: Whether to convert images to float32.
         num_views: Number of camera views.
         data_root: Root directory for data.
+        to_rgb: Convert OpenCV BGR images to RGB.
     """
 
-    def __init__(self, to_float32: bool = True, num_views: int = 6, data_root: str = 'data/nuscenes'):
+    def __init__(
+        self,
+        to_float32: bool = True,
+        num_views: int = 6,
+        data_root: str = 'data/nuscenes',
+        to_rgb: bool = True,
+    ):
         self.to_float32 = to_float32
         self.num_views = num_views
         self.data_root = data_root
+        self.to_rgb = to_rgb
 
     def __call__(self, results: Dict) -> Dict:
         """Load images and camera parameters.
@@ -63,7 +71,8 @@ class LoadMultiViewImages:
 
             # Load image with OpenCV (faster than PIL)
             img = cv2.imread(img_path)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # OpenCV loads as BGR
+            if self.to_rgb:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # OpenCV loads as BGR
             imgs.append(img)
 
             # Camera intrinsics (3x3 -> 4x4)
@@ -707,14 +716,24 @@ class LoadMultiSweepImages:
         render_h: Render target height.
         render_w: Render target width.
         data_root: Root directory for T4 data.
+        to_rgb: Convert OpenCV BGR images to RGB.
     """
 
-    def __init__(self, num_sweeps=7, num_cams=5, render_h=180, render_w=320, data_root=''):
+    def __init__(
+        self,
+        num_sweeps=7,
+        num_cams=5,
+        render_h=180,
+        render_w=320,
+        data_root='',
+        to_rgb=False,
+    ):
         self.num_sweeps = num_sweeps
         self.num_cams = num_cams
         self.render_h = render_h
         self.render_w = render_w
         self.data_root = data_root
+        self.to_rgb = to_rgb
 
     def __call__(self, results):
         N = self.num_cams
@@ -744,20 +763,34 @@ class LoadMultiSweepImages:
             ego2cam = np.linalg.inv(cur_cam2ego[n])
             ego2img_list.append(cur_cam2img[n] @ ego2cam)
 
-        # Store render_k (intrinsics) and cam2ego for gsplat rendering
-        results['render_k'] = cur_cam2img.copy()
+        # Store render_k scaled to render resolution for gsplat rendering.
+        img_h, img_w = results['img'][0].shape[:2]
+        render_k = cur_cam2img.copy()
+        render_k[..., 0, :] *= float(self.render_w) / float(img_w)
+        render_k[..., 1, :] *= float(self.render_h) / float(img_h)
+        results['render_k'] = render_k
 
-        # Load sweep images and compute transforms
+        # Match PG-Occ sweep selection behavior:
+        # if fewer sweeps are available, repeat the last available sweep.
+        if len(sweeps) == 0:
+            sweep_indices = [None] * self.num_sweeps
+        elif len(sweeps) <= self.num_sweeps:
+            sweep_indices = list(range(len(sweeps))) + [len(sweeps) - 1] * (self.num_sweeps - len(sweeps))
+        else:
+            sweep_indices = list(range(self.num_sweeps))
+
+        # Load sweep images and compute transforms.
         sweep_imgs = []
-        t0_2_x_geo = []  # [num_sweeps*N, 4, 4]
+        t0_2_x_geo = []
 
-        actual_sweeps = min(len(sweeps), self.num_sweeps)
-        for s_idx in range(actual_sweeps):
-            sweep = sweeps[s_idx]
-            for cam_name in cam_names:
-                if cam_name not in sweep['images']:
-                    continue
-                s_cam = sweep['images'][cam_name]
+        for sweep_idx in sweep_indices:
+            sweep = sweeps[sweep_idx] if sweep_idx is not None else None
+            for n, cam_name in enumerate(cam_names):
+                if sweep is not None and cam_name in sweep.get('images', {}):
+                    s_cam = sweep['images'][cam_name]
+                else:
+                    # Fallback to current frame for missing/empty sweep entries.
+                    s_cam = results['images'][cam_name]
 
                 # Load sweep image
                 img_path = s_cam['img_path']
@@ -765,7 +798,9 @@ class LoadMultiSweepImages:
                     img_path = os.path.join(self.data_root, img_path)
                 img = cv2.imread(img_path)
                 if img is not None:
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+                    if self.to_rgb:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    img = img.astype(np.float32)
                     sweep_imgs.append(img)
                 else:
                     h, w = results['img'][0].shape[:2]
@@ -776,16 +811,17 @@ class LoadMultiSweepImages:
                 s_c2i = np.eye(4, dtype=np.float32)
                 s_c2i[:3, :3] = s_c2i_3x3 if s_c2i_3x3.shape == (3, 3) else s_c2i_3x3[:3, :3]
                 s_cam2ego = np.array(s_cam['cam2ego'], dtype=np.float32)
-                s_ego2cam = np.linalg.inv(s_cam2ego)
-                ego2img_list.append(s_c2i @ s_ego2cam)
-
-            # Compute t0_2_x_geo: current cam -> past cam transform per camera
-            for n, cam_name in enumerate(cam_names):
-                if cam_name not in sweep['images']:
-                    continue
-                s_cam = sweep['images'][cam_name]
                 s_ego2global = np.array(s_cam['ego2global'], dtype=np.float32)
-                s_cam2ego = np.array(s_cam['cam2ego'], dtype=np.float32)
+
+                # Map current-ego points to sweep image:
+                # current ego -> global -> sweep ego -> sweep cam -> image.
+                s_ego2img = (
+                    s_c2i
+                    @ np.linalg.inv(s_cam2ego)
+                    @ np.linalg.inv(s_ego2global)
+                    @ cur_ego2global[n]
+                )
+                ego2img_list.append(s_ego2img)
 
                 # T = inv(s_cam2ego) @ inv(s_ego2global) @ cur_ego2global[n] @ cur_cam2ego[n]
                 T = (np.linalg.inv(s_cam2ego) @
@@ -794,18 +830,9 @@ class LoadMultiSweepImages:
                      cur_cam2ego[n])
                 t0_2_x_geo.append(T)
 
-        # Pad if fewer sweeps than requested
-        while len(sweep_imgs) < self.num_sweeps * N:
-            pad_idx = len(sweep_imgs) % N
-            sweep_imgs.append(results['img'][pad_idx].copy())
-        while len(t0_2_x_geo) < self.num_sweeps * N:
-            t0_2_x_geo.append(np.eye(4, dtype=np.float32))
-        while len(ego2img_list) < (1 + self.num_sweeps) * N:
-            ego2img_list.append(np.eye(4, dtype=np.float32))
-
-        # Generate render_gt: all images at render resolution [T*N, Rh, Rw, 3]
+        # Generate render_gt: current + two temporal frames (PG-Occ loss contract).
         render_gt_imgs = []
-        all_imgs = list(results['img'][:N]) + sweep_imgs[:self.num_sweeps * N]
+        all_imgs = list(results['img'][:N]) + sweep_imgs[:2 * N]
         for img in all_imgs:
             img_u8 = img.astype(np.uint8) if img.max() > 1.0 else (img * 255).astype(np.uint8)
             resized = cv2.resize(img_u8, (self.render_w, self.render_h),
@@ -817,7 +844,7 @@ class LoadMultiSweepImages:
 
         # Store computed arrays
         results['ego2img'] = np.stack(ego2img_list[:(1 + self.num_sweeps) * N])
-        results['t0_2_x_geo'] = np.stack(t0_2_x_geo[:self.num_sweeps * N])
+        results['t0_2_x_geo'] = np.stack(t0_2_x_geo[:2 * N])
         results['render_gt'] = np.stack(render_gt_imgs)
         results['cam2ego'] = cur_cam2ego  # [N, 4, 4] current frame only
 
@@ -827,8 +854,8 @@ class LoadMultiSweepImages:
 class ResizePGOccImages:
     """Resize images to target resolution for PG-Occ.
 
-    Simple resize without crop/flip/rotate. PG-Occ handles normalization
-    and augmentation in the model's extract_feat.
+    Matches original PG-Occ deterministic IDA transform (training=False):
+    isotropic resize + crop, without flip/rotate.
 
     Args:
         target_size: Target (H, W) for backbone input.
@@ -838,14 +865,38 @@ class ResizePGOccImages:
         self.target_h, self.target_w = target_size
 
     def __call__(self, results):
+        src_h, src_w = results['img'][0].shape[:2]
+
+        # Same policy as RandomTransformImage(training=False):
+        # resize = max(fH/H, fW/W), then center-crop width and bottom-crop height.
+        resize = max(float(self.target_h) / float(src_h), float(self.target_w) / float(src_w))
+        new_w = max(self.target_w, int(src_w * resize))
+        new_h = max(self.target_h, int(src_h * resize))
+        crop_h = int(new_h - self.target_h)
+        crop_w = int(max(0, new_w - self.target_w) / 2)
+        x1, y1 = crop_w, crop_h
+        x2, y2 = crop_w + self.target_w, crop_h + self.target_h
+
         resized = []
         for img in results['img']:
             if img.shape[:2] != (self.target_h, self.target_w):
                 img_u8 = img.astype(np.uint8) if img.max() > 1.0 else (img * 255).astype(np.uint8)
-                img = cv2.resize(img_u8, (self.target_w, self.target_h),
-                                 interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                img = cv2.resize(img_u8, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                img = img[y1:y2, x1:x2].astype(np.float32)
             resized.append(img)
         results['img'] = resized
+
+        # Keep projection matrices consistent with resized + cropped images.
+        if 'ego2img' in results:
+            ida_mat = np.eye(4, dtype=np.float32)
+            ida_mat[0, 0] = resize
+            ida_mat[1, 1] = resize
+            ida_mat[0, 2] = -float(crop_w)
+            ida_mat[1, 2] = -float(crop_h)
+            ego2img = np.array(results['ego2img'], dtype=np.float32, copy=True)
+            ego2img = np.matmul(ida_mat[None, ...], ego2img)
+            results['ego2img'] = ego2img
+
         results['img_shape'] = (self.target_h, self.target_w)
         return results
 
@@ -857,8 +908,8 @@ class PackPGOccInputs:
     - img: [T*N, 3, H, W] images
     - depth: [N, 1, Hd, Wd] foundation depth
     - text_vision: [N, C, Hf, Wf] DINOv3CLIP features
-    - render_gt: [T*N, Rh, Rw, 3] render targets
-    - t0_2_x_geo: [(T-1)*N, 4, 4] ego-to-ego transforms
+    - render_gt: [3*N, Rh, Rw, 3] warping targets (current + 2 temporal)
+    - t0_2_x_geo: [2*N, 4, 4] ego-to-ego transforms for temporal warping
     - img_metas: dict with ego2img, cam2ego, render_k
     """
 
@@ -889,7 +940,8 @@ class PackPGOccInputs:
                 depth = F.interpolate(
                     depth.float(),
                     size=(self.render_h, self.render_w),
-                    mode='nearest',
+                    mode='bilinear',
+                    align_corners=False,
                 )
             packed['depth'] = depth
 
@@ -944,10 +996,10 @@ def get_pgocc_train_transforms(
 ):
     """Get PG-Occ training transforms."""
     return Compose([
-        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root),
+        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root, to_rgb=False),
         LoadMultiSweepImages(
             num_sweeps=num_sweeps, num_cams=num_cams,
-            render_h=render_h, render_w=render_w, data_root=data_root),
+            render_h=render_h, render_w=render_w, data_root=data_root, to_rgb=False),
         ResizePGOccImages(target_size=input_size),
         LoadFeatMaps(
             data_root=depth_root, key='depth', apply_aug=False,
@@ -972,10 +1024,10 @@ def get_pgocc_val_transforms(
 ):
     """Get PG-Occ validation transforms (same pipeline, no random aug)."""
     return Compose([
-        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root),
+        LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root, to_rgb=False),
         LoadMultiSweepImages(
             num_sweeps=num_sweeps, num_cams=num_cams,
-            render_h=render_h, render_w=render_w, data_root=data_root),
+            render_h=render_h, render_w=render_w, data_root=data_root, to_rgb=False),
         ResizePGOccImages(target_size=input_size),
         LoadFeatMaps(
             data_root=depth_root, key='depth', apply_aug=False,

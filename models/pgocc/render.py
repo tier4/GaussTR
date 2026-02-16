@@ -87,7 +87,7 @@ def prepare_gs_attribute(img_metas, num_cams=5):
     if not isinstance(render_k, torch.Tensor):
         render_k = torch.tensor(np.array(render_k)).float()
 
-    C2W = cam2ego.float().cuda()  # [N, 4, 4]
+    C2W = cam2ego[0:num_cams].float().cuda()  # [N, 4, 4]
     W2C = torch.inverse(C2W)
     render_k = render_k[0:num_cams].float().cuda()
 

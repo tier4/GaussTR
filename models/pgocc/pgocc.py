@@ -31,6 +31,7 @@ class PGOccLightning(pl.LightningModule):
         self,
         # Backbone
         frozen_stages: int = 1,
+        norm_eval: bool = True,
         backbone_pretrained: str = "",
         # Architecture
         embed_dims: int = 256,
@@ -63,13 +64,16 @@ class PGOccLightning(pl.LightningModule):
         learning_rate: float = 2e-4,
         weight_decay: float = 0.01,
         backbone_lr_mult: float = 0.1,
+        sampling_offset_lr_mult: float = 0.1,
         gradient_clip_val: float = 350.0,
         warmup_iters: int = 500,
+        warmup_factor: float = 1.0 / 3.0,
         lr_schedule: str = "cosine",
         min_lr_ratio: float = 0.001,
         # Augmentation
         use_grid_mask: bool = False,
         img_color_aug: bool = True,
+        to_rgb: bool = True,
         size_divisor: int = 32,
         mean: list = None,
         std: list = None,
@@ -106,8 +110,12 @@ class PGOccLightning(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.backbone_lr_mult = backbone_lr_mult
+        self.sampling_offset_lr_mult = sampling_offset_lr_mult
         self.warmup_iters = warmup_iters
+        self.warmup_factor = warmup_factor
         self.min_lr_ratio = min_lr_ratio
+        self.to_rgb = to_rgb
+        self.norm_eval = norm_eval
         self.training_iter = 0
 
         # Image normalization
@@ -231,6 +239,10 @@ class PGOccLightning(pl.LightningModule):
         if self.training and self.img_color_aug:
             img = self.color_aug(img)
 
+        # Match original PG-Occ normalization path: BGR -> RGB before norm.
+        if self.to_rgb:
+            img = img[:, [2, 1, 0], :, :]
+
         # Normalize
         img = (img - self.img_mean) / self.img_std
 
@@ -238,10 +250,15 @@ class PGOccLightning(pl.LightningModule):
         for b in range(B):
             img_shape = (img.shape[2], img.shape[3], img.shape[1])
             img_metas[b]['img_shape'] = [img_shape for _ in range(TN)]
+            img_metas[b]['ori_shape'] = [img_shape for _ in range(TN)]
 
         # Pad to size_divisor
         if self.size_divisor > 1:
             img = pad_multiple(img, img_metas, size_divisor=self.size_divisor)
+
+        input_shape = img.shape[-2:]
+        for img_meta in img_metas:
+            img_meta.update(input_shape=input_shape)
 
         # Grid mask augmentation
         if self.training and self.grid_mask is not None:
@@ -424,8 +441,9 @@ class PGOccLightning(pl.LightningModule):
 
     def configure_optimizers(self):
         """Configure AdamW with backbone lr multiplier and cosine schedule."""
-        # Separate backbone vs non-backbone parameters
+        # Separate backbone / sampling_offset / other parameters.
         backbone_params = []
+        sampling_offset_params = []
         other_params = []
 
         backbone_modules = [self.backbone_stem, self.backbone_layers]
@@ -436,14 +454,27 @@ class PGOccLightning(pl.LightningModule):
                     backbone_params.append(p)
                     backbone_param_ids.add(id(p))
 
-        for p in self.parameters():
-            if p.requires_grad and id(p) not in backbone_param_ids:
+        for name, p in self.named_parameters():
+            if not p.requires_grad or id(p) in backbone_param_ids:
+                continue
+            if 'sampling_offset' in name:
+                sampling_offset_params.append(p)
+            else:
                 other_params.append(p)
 
-        param_groups = [
-            {'params': other_params, 'lr': self.learning_rate},
-            {'params': backbone_params, 'lr': self.learning_rate * self.backbone_lr_mult},
-        ]
+        param_groups = []
+        if other_params:
+            param_groups.append({'params': other_params, 'lr': self.learning_rate})
+        if sampling_offset_params:
+            param_groups.append({
+                'params': sampling_offset_params,
+                'lr': self.learning_rate * self.sampling_offset_lr_mult,
+            })
+        if backbone_params:
+            param_groups.append({
+                'params': backbone_params,
+                'lr': self.learning_rate * self.backbone_lr_mult,
+            })
 
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -456,7 +487,8 @@ class PGOccLightning(pl.LightningModule):
 
         def lr_lambda(step):
             if step < warmup_steps:
-                return step / max(warmup_steps, 1)
+                alpha = step / max(warmup_steps, 1)
+                return self.warmup_factor + (1.0 - self.warmup_factor) * alpha
             progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
             return max(self.min_lr_ratio, 0.5 * (1.0 + math.cos(progress * math.pi)))
 
@@ -475,6 +507,10 @@ class PGOccLightning(pl.LightningModule):
         """Override to keep frozen backbone stages in eval mode."""
         super().train(mode)
         if mode:
+            if self.norm_eval:
+                for m in self.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
             # Keep frozen stages in eval mode
             if self._frozen_stages >= 0:
                 self.backbone_stem.eval()
