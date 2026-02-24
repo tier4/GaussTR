@@ -151,6 +151,7 @@ class PGOccLightning(pl.LightningModule):
             ov_dim=ov_dim if use_ov else 0,
             render_conf=self.render_conf,
         )
+        self.decoder.init_weights()
 
         # === Projection modules for temporal warping loss ===
         self.backproject_depth = BackprojectDepth(num_cams, render_h, render_w)
@@ -175,21 +176,36 @@ class PGOccLightning(pl.LightningModule):
         """Build ResNet50 backbone with optional COCO pretrained weights."""
         backbone = resnet50(weights=None)
 
-        # Load pretrained weights (COCO Cascade Mask R-CNN or ImageNet)
+        # Load pretrained weights (local checkpoint path)
         if pretrained_path and os.path.exists(pretrained_path):
             ckpt = torch.load(pretrained_path, map_location='cpu')
-            state_dict = ckpt.get('state_dict', ckpt)
-            # Strip common prefixes from detection checkpoints
+            state_dict = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+
+            # Strip common prefixes from mmcv/mmdet checkpoints.
+            prefixes = (
+                'img_backbone.',
+                'module.img_backbone.',
+                'model.img_backbone.',
+                'backbone.',
+                'module.backbone.',
+                'model.backbone.',
+            )
             cleaned = {}
             for k, v in state_dict.items():
-                for prefix in ('backbone.', 'module.backbone.', 'model.backbone.'):
-                    if k.startswith(prefix):
-                        k = k[len(prefix):]
+                new_k = k
+                for prefix in prefixes:
+                    if new_k.startswith(prefix):
+                        new_k = new_k[len(prefix):]
                         break
-                cleaned[k] = v
+                if new_k.startswith('module.'):
+                    new_k = new_k[len('module.'):]
+                cleaned[new_k] = v
+
             missing, unexpected = backbone.load_state_dict(cleaned, strict=False)
-            print(f"Loaded backbone weights from {pretrained_path} "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            print(
+                f"Loaded backbone weights from {pretrained_path} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
         else:
             # Fall back to ImageNet pretrained
             from torchvision.models import ResNet50_Weights
