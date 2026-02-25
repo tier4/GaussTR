@@ -121,7 +121,7 @@ trainer:
   accelerator: "gpu"
   devices: 8
   strategy: "ddp_find_unused_parameters_true"
-  precision: "16-mixed"
+  precision: "bf16-mixed"
   gradient_clip_val: 35.0
   gradient_clip_algorithm: "norm"
   accumulate_grad_batches: 4
