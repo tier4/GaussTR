@@ -74,6 +74,7 @@ class GaussTRDataModule(pl.LightningDataModule):
         render_h: int = 180,
         render_w: int = 320,
         num_sweeps: int = 7,
+        warp_sweep_indices: list = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -106,6 +107,7 @@ class GaussTRDataModule(pl.LightningDataModule):
         self.render_h = render_h
         self.render_w = render_w
         self.num_sweeps = num_sweeps
+        self.warp_sweep_indices = warp_sweep_indices
 
         self.train_dataset = None
         self.val_dataset = None
@@ -217,6 +219,7 @@ class GaussTRDataModule(pl.LightningDataModule):
             num_sweeps=self.num_sweeps,
             num_cams=self.num_views,
             num_views=self.num_views,
+            warp_sweep_indices=self.warp_sweep_indices,
         )
 
         if stage == 'fit' or stage is None:

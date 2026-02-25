@@ -389,13 +389,9 @@ class PGOccLightning(pl.LightningModule):
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
                 total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos']
 
-            # Foundation depth loss (masked to backbone-visible region + alpha coverage).
-            # Alpha masking is critical: pixels with no Gaussian coverage have
-            # render_depth≈0.1 (clamped) and zero gsplat gradient, but contribute
-            # large constant SiLog values that dilute the gradient ~3x.
+            # Foundation depth loss (masked to backbone-visible region)
             depth_tgt = batch['depth'].clone().squeeze(0)  # [N, 1, Hd, Wd]
-            render_alpha = render_results['alphas'].permute(0, 3, 1, 2)  # [N, 1, H, W]
-            mask = (depth_tgt > 0.1) & (depth_tgt < 51.2) & (render_alpha > 0.1)
+            mask = (depth_tgt > 0.1) & (depth_tgt < 51.2)
             if valid_row > 0:
                 mask[:, :, :valid_row, :] = False
             mask.detach_()
@@ -403,85 +399,12 @@ class PGOccLightning(pl.LightningModule):
             loss_dict[f'depth_{i}'] = loss_depth.item()
             total_loss = total_loss + loss_depth * self.loss_weights['depth_foundation']
 
-            # Direct per-Gaussian position loss: provides strong xyz gradient
-            # independent of rendering coverage, breaking the scale-coverage
-            # feedback loop that starves position gradients.
-            w_direct = self.loss_weights.get('direct_depth', 0)
-            if w_direct > 0:
-                loss_direct = self._compute_direct_depth_loss(
-                    gaussian, W2C, K, depth_tgt, valid_row=valid_row)
-                loss_dict[f'direct_depth_{i}'] = loss_direct.item()
-                total_loss = total_loss + loss_direct * w_direct
-
         # Log losses
         self.log('train_loss', total_loss, prog_bar=True, sync_dist=True)
         for k, v in loss_dict.items():
             self.log(f'train/{k}', v, sync_dist=True)
 
         return total_loss
-
-    def _compute_direct_depth_loss(self, gaussian, W2C, K, depth_tgt, valid_row=0):
-        """Direct per-Gaussian position-to-depth loss.
-
-        For each Gaussian, projects its center onto each camera and compares
-        the Gaussian's camera-space depth to the GT depth at that pixel.
-        This provides strong direct gradient to xyz positions independent of
-        rendering coverage — breaking the scale-coverage feedback loop where
-        shrinking scales reduce pixel coverage and starve position gradients.
-
-        Gradient: d(loss)/d(means) = sign(z_cam - d_gt) * W2C[2, :3]
-        (direction along camera ray, magnitude 1 — no attenuation from alpha compositing)
-        """
-        means = gaussian.means.squeeze(0)  # [Q, 3]
-        Q = means.shape[0]
-        N = W2C.shape[0]
-        H, W_img = depth_tgt.shape[2], depth_tgt.shape[3]
-
-        means_homo = torch.cat(
-            [means, torch.ones(Q, 1, device=means.device)], dim=-1)  # [Q, 4]
-
-        losses = []
-        for cam_idx in range(N):
-            p_cam = (W2C[cam_idx] @ means_homo.T).T[:, :3]  # [Q, 3]
-            z_cam = p_cam[:, 2]
-
-            # Project to pixel coordinates
-            K3 = K[cam_idx, :3, :3]
-            uv_h = (K3 @ p_cam.T).T  # [Q, 3]
-            uv = uv_h[:, :2] / uv_h[:, 2:3].clamp(min=0.01)
-
-            # Valid: in frame, positive depth, within range, in backbone-visible region
-            valid = ((uv[:, 0] >= 0) & (uv[:, 0] < W_img)
-                     & (uv[:, 1] >= valid_row) & (uv[:, 1] < H)
-                     & (z_cam > 0.5) & (z_cam < 51.2))
-            if valid.sum() == 0:
-                continue
-
-            # Sample GT depth at projected pixel (no grad needed for sampling coords)
-            with torch.no_grad():
-                grid_x = uv[valid, 0] / (W_img - 1) * 2 - 1
-                grid_y = uv[valid, 1] / (H - 1) * 2 - 1
-                grid = torch.stack([grid_x, grid_y], dim=-1)
-                grid = grid.unsqueeze(0).unsqueeze(0)  # [1, 1, M, 2]
-                d_gt = F.grid_sample(
-                    depth_tgt[cam_idx:cam_idx + 1], grid,
-                    mode='bilinear', align_corners=True,
-                ).squeeze()  # [M]
-
-            z_valid = z_cam[valid]
-            # Only supervise where GT is valid and Gaussian is near the surface
-            with torch.no_grad():
-                gt_ok = (d_gt > 0.1) & (d_gt < 51.2)
-                close = (z_valid - d_gt).abs() < 10.0
-                final_mask = gt_ok & close
-
-            if final_mask.sum() == 0:
-                continue
-            losses.append(F.l1_loss(z_valid[final_mask], d_gt[final_mask]))
-
-        if not losses:
-            return torch.tensor(0.0, device=means.device)
-        return torch.stack(losses).mean()
 
     def validation_step(self, batch, batch_idx):
         """Validation step: predict occupancy grid."""

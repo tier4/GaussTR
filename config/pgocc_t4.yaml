@@ -50,11 +50,10 @@ model:
 
   # Losses
   loss_weights:
-    depth_warping: 5.0
+    depth_warping: 10.0
     ov_mse: 10.0
-    ov_cos: 0.1
-    depth_foundation: 2.0
-    direct_depth: 1.0
+    ov_cos: 1.0
+    depth_foundation: 0.5
 
   # Evaluation
   density_threshold: 0.04
@@ -97,6 +96,7 @@ data:
 
   # Temporal
   num_sweeps: 7  # + current = 8 frames total
+  warp_sweep_indices: [4, 6]  # T4=10Hz: sweep[4]≈0.5s, sweep[6]≈0.7s (≈nuScenes 2Hz baseline)
 
   # Dataset
   dataset_type: "t4"
@@ -117,14 +117,14 @@ data:
   prefetch_factor: 2
 
 trainer:
-  max_epochs: 24
+  max_epochs: 8
   accelerator: "gpu"
   devices: 8
   strategy: "ddp_find_unused_parameters_true"
   precision: "bf16-mixed"
-  gradient_clip_val: 35.0
+  gradient_clip_val: 350.0
   gradient_clip_algorithm: "norm"
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 1
   val_check_interval: 1.0
   check_val_every_n_epoch: 1
   limit_val_batches: 0

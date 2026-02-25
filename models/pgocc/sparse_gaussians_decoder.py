@@ -46,8 +46,7 @@ class SparseGaussiansDecoder(nn.Module):
                  num_queries=None,
                  ov_dim=768,
                  restrict_xyz=True,
-                 use_anisotropy_encoding=True,
-                 scale_multiplier=7.5):
+                 use_anisotropy_encoding=True):
         super().__init__()
 
         self.embed_dims = embed_dims
@@ -57,7 +56,6 @@ class SparseGaussiansDecoder(nn.Module):
         self.render_conf = render_conf or {}
         self.num_queries = num_queries or [4000, 1000, 1000]
         self.use_anisotropy_encoding = use_anisotropy_encoding
-        self.scale_multiplier = scale_multiplier
 
         total_queries = sum(self.num_queries)
         self.query_embeds = nn.Embedding(total_queries, embed_dims)
@@ -113,42 +111,17 @@ class SparseGaussiansDecoder(nn.Module):
                     ),
                 ]))
 
-        unit_quaternion = torch.zeros(1, 1, 4)
-        unit_quaternion[..., 0] = 1.0
-        self.register_buffer('unit_quaternion', unit_quaternion)
-
     @torch.no_grad()
     def init_weights(self):
         for layer in self.decoder_layers:
             layer.init_weights()
 
-        # Initialize gau_pred_heads scale bias for smaller initial Gaussians.
-        # The 11D output is: [xyz_delta(3), rotation(4), scale(3), opacity(1)]
-        #
-        # Scale bias=-3: sigmoid(-3)*6.4 = 0.30m base scale. With depth-adaptive
-        # scaling, effective projected size ≈ 2.3px (theoretical). In practice,
-        # network weight noise raises actual scales to ~0.8m mean, giving ~57%
-        # mean per-pixel alpha — sufficient for gradient flow.
-        #
-        # Opacity is left at default (~0 → sigmoid=0.5) because depth-adaptive
-        # scaling already prevents fog: small scales keep per-pixel alpha moderate
-        # even at full opacity. The fog wall was caused by LARGE default scales
-        # (3.2m without bias init), not by high opacity.
-        for head in self.gau_pred_heads:
-            output_layer = head[2]  # nn.Sequential(Linear, ReLU, Linear(1024, 11))
-            # Scale channels (7:10): sigmoid(-3) ≈ 0.047 base factor
-            output_layer.bias.data[7:10] = -3.0
-            # Opacity channel (10): leave at default (~0) → sigmoid ≈ 0.5
-
-    def query_2_gaussian(self, gau_pred, scale_range=(0.1, 6.4), depth_scale=None):
+    def query_2_gaussian(self, gau_pred, scale_range=(0.0, 6.4)):
         """Map 11D predictions to Gaussian parameters.
 
         Args:
             gau_pred: [B, Q, 11] raw predictions
-            scale_range: (min, max) base scale range
-            depth_scale: Optional [B, Q, 1] per-Gaussian depth-adaptive factor.
-                If provided, modulates scale_range so sigmoid output represents
-                a fraction of the depth-appropriate scale, not absolute meters.
+            scale_range: (min, max) scale range (original: 0.0, 6.4)
         """
         gau_pred = torch.nan_to_num(gau_pred, nan=0.0)
 
@@ -163,15 +136,8 @@ class SparseGaussiansDecoder(nn.Module):
         gau_rots = F.normalize(gau_pred[..., 3:7], dim=-1)
         gau_rots = torch.nan_to_num(gau_rots, nan=0.0)
 
-        # Depth-adaptive scale range: sigmoid output is fraction of depth-appropriate max.
-        # Minimum scale 0.1m prevents Gaussian collapse (invisible → zero gradient → dead).
-        min_scale = 0.1
-        if depth_scale is not None:
-            adaptive_max = scale_range[1] * depth_scale  # [B, Q, 1]
-            gau_scales = torch.sigmoid(gau_pred[..., 7:10]) * adaptive_max + min_scale
-        else:
-            gau_scales = torch.sigmoid(gau_pred[..., 7:10]) * (scale_range[1] - scale_range[0]) + min_scale
-        gau_scales = torch.nan_to_num(gau_scales, nan=min_scale)
+        gau_scales = torch.sigmoid(gau_pred[..., 7:10]) * (scale_range[1] - scale_range[0]) + scale_range[0]
+        gau_scales = torch.nan_to_num(gau_scales, nan=0.0)
 
         gau_opacities = torch.sigmoid(gau_pred[..., 10:11]).squeeze(-1)
         gau_opacities = torch.nan_to_num(gau_opacities, nan=0.5)
@@ -241,8 +207,6 @@ class SparseGaussiansDecoder(nn.Module):
                 query_coord = ego_points_coarse[indices].reshape(B, -1, 3)
 
         # --- Progressive decoder layers ---
-        prev_scales = None
-        prev_rots = None
         for i, layer in enumerate(self.decoder_layers):
             # Refine depth residual mask for progressive densification
             if i != 0:
@@ -309,25 +273,8 @@ class SparseGaussiansDecoder(nn.Module):
                     point2bbox(query_coord_fine, box_size=0.4), pc_range=self.pc_range)
                 query_bbox = torch.cat([query_bbox, query_bbox_medium, query_bbox_fine], dim=1)
 
-            # Anisotropy-aware sampling: use predicted scales/rotations from previous layer
-            if not self.use_anisotropy_encoding or i == 0:
-                anisotropy_info = None
-            elif i == 1:
-                # prev_scales from layer 0: [B, 4000, 3], add defaults for new medium queries
-                default_scale = torch.ones(B, self.num_queries[1], 3, device=prev_scales.device) * 0.8
-                default_rot = self.unit_quaternion.expand(B, self.num_queries[1], 4).contiguous()
-                anisotropy_info = {
-                    'scale': torch.cat([prev_scales, default_scale], dim=1),
-                    'rotation': torch.cat([prev_rots, default_rot], dim=1),
-                }
-            elif i == 2:
-                # prev_scales from layer 1: [B, 5000, 3], add defaults for new fine queries
-                default_scale = torch.ones(B, self.num_queries[2], 3, device=prev_scales.device) * 0.4
-                default_rot = self.unit_quaternion.expand(B, self.num_queries[2], 4).contiguous()
-                anisotropy_info = {
-                    'scale': torch.cat([prev_scales, default_scale], dim=1),
-                    'rotation': torch.cat([prev_rots, default_rot], dim=1),
-                }
+            # Anisotropy disabled to match original runtime behavior
+            anisotropy_info = None
 
             query_feat_part = query_feat[:, :query_bbox.size(1)]
             query_feat_part = layer(query_feat_part, query_bbox, mlvl_feats, anisotropy_info, img_metas)
@@ -335,25 +282,14 @@ class SparseGaussiansDecoder(nn.Module):
             gau_pred = self.gau_pred_heads[i](query_feat_part)
             all_scales, all_rots, all_opacities = [], [], []
 
-            # Depth-adaptive scale factor: modulates scale_range inside
-            # query_2_gaussian so sigmoid output = fraction of depth-appropriate
-            # max, not absolute meters. Mirrors GaussTR scale_transform.
-            distance = torch.norm(query_coord.detach(), dim=-1, keepdim=True)
-            distance = torch.nan_to_num(distance, nan=1.0).clamp(min=1.0)
-            mean_focal = render_k[:, 0, 0].mean()
-            ds = (distance * self.scale_multiplier / mean_focal).clamp(min=0.1, max=10.0)
-
             if i == 0:
-                gaussian = self.query_2_gaussian(
-                    gau_pred, scale_range=(0.0, 6.4), depth_scale=ds)
+                gaussian = self.query_2_gaussian(gau_pred)
                 query_coord = gaussian['delta_xyz'] + query_coord
                 all_scales.append(gaussian['gau_scales'])
                 all_rots.append(gaussian['gau_rots'])
                 all_opacities.append(gaussian['gau_opacities'])
             elif i == 1:
-                gaussian = self.query_2_gaussian(
-                    gau_pred[:, :q0], scale_range=(0.0, 6.4),
-                    depth_scale=ds[:, :q0])
+                gaussian = self.query_2_gaussian(gau_pred[:, :q0])
                 query_coord[:, :q0] = (
                     gaussian['delta_xyz'] + query_coord[:, :q0]
                 )
@@ -361,11 +297,7 @@ class SparseGaussiansDecoder(nn.Module):
                 all_rots.append(gaussian['gau_rots'])
                 all_opacities.append(gaussian['gau_opacities'])
 
-                gaussian_medium = self.query_2_gaussian(
-                    gau_pred[:, q0:q0 + q1],
-                    scale_range=(0.0, 6.4),
-                    depth_scale=ds[:, q0:q0 + q1],
-                )
+                gaussian_medium = self.query_2_gaussian(gau_pred[:, q0:q0 + q1])
                 query_coord[:, q0:q0 + q1] = (
                     gaussian_medium['delta_xyz'] / 2
                     + query_coord[:, q0:q0 + q1]
@@ -374,9 +306,7 @@ class SparseGaussiansDecoder(nn.Module):
                 all_rots.append(gaussian_medium['gau_rots'])
                 all_opacities.append(gaussian_medium['gau_opacities'])
             elif i == 2:
-                gaussian = self.query_2_gaussian(
-                    gau_pred[:, :q0], scale_range=(0.0, 6.4),
-                    depth_scale=ds[:, :q0])
+                gaussian = self.query_2_gaussian(gau_pred[:, :q0])
                 query_coord[:, :q0] = (
                     gaussian['delta_xyz'] + query_coord[:, :q0]
                 )
@@ -384,11 +314,7 @@ class SparseGaussiansDecoder(nn.Module):
                 all_rots.append(gaussian['gau_rots'])
                 all_opacities.append(gaussian['gau_opacities'])
 
-                gaussian_medium = self.query_2_gaussian(
-                    gau_pred[:, q0:q0 + q1],
-                    scale_range=(0.0, 6.4),
-                    depth_scale=ds[:, q0:q0 + q1],
-                )
+                gaussian_medium = self.query_2_gaussian(gau_pred[:, q0:q0 + q1])
                 query_coord[:, q0:q0 + q1] = (
                     gaussian_medium['delta_xyz'] / 2
                     + query_coord[:, q0:q0 + q1]
@@ -397,11 +323,7 @@ class SparseGaussiansDecoder(nn.Module):
                 all_rots.append(gaussian_medium['gau_rots'])
                 all_opacities.append(gaussian_medium['gau_opacities'])
 
-                gaussian_fine = self.query_2_gaussian(
-                    gau_pred[:, q0 + q1:],
-                    scale_range=(0.0, 6.4),
-                    depth_scale=ds[:, q0 + q1:],
-                )
+                gaussian_fine = self.query_2_gaussian(gau_pred[:, q0 + q1:])
                 query_coord[:, q0 + q1:] = (
                     gaussian_fine['delta_xyz'] / 4
                     + query_coord[:, q0 + q1:]
@@ -413,10 +335,6 @@ class SparseGaussiansDecoder(nn.Module):
             merged_scales = torch.cat(all_scales, dim=1)
             merged_rots = torch.cat(all_rots, dim=1)
             merged_opacities = torch.cat(all_opacities, dim=1)
-
-            # Track for next layer's anisotropy_info
-            prev_scales = merged_scales.detach()
-            prev_rots = merged_rots.detach()
 
             # OV feature prediction
             if self.render_conf.get('use_ov', True) and len(self.ov_heads) > i:

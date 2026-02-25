@@ -317,9 +317,10 @@ def _load_png_as_array(path: str, depth_scale: float = None) -> np.ndarray:
 
     # Handle 16-bit depth PNGs (e.g., from Prior-Depth-Anything)
     if img.dtype == np.uint16 and depth_scale is not None:
-        # ~3% of PriorDA frames were encoded with scale=1000 instead of 650,
-        # detectable by saturated max value (65535 = 65.535m at scale=1000,
-        # vs 100.8m at scale=650 which rarely saturates for driving scenes).
+        # ~8% of PriorDA chunks were encoded with scale=1000 instead of 650.
+        # Saturated pixels (max==65535) indicate scale=1000, but this heuristic
+        # only catches ~61% of affected files. Run scripts/t4/fix_priorda_scale.py
+        # to permanently fix all files, then this fallback becomes a no-op.
         if img.max() == 65535:
             return img.astype(np.float32) / 1000.0
         return img.astype(np.float32) / depth_scale
@@ -732,6 +733,7 @@ class LoadMultiSweepImages:
         render_w=320,
         data_root='',
         to_rgb=False,
+        warp_sweep_indices=None,
     ):
         self.num_sweeps = num_sweeps
         self.num_cams = num_cams
@@ -739,6 +741,11 @@ class LoadMultiSweepImages:
         self.render_w = render_w
         self.data_root = data_root
         self.to_rgb = to_rgb
+        # Which sweeps to use for temporal warping loss (render_gt / t0_2_x_geo).
+        # Default [0, 1] matches original PG-Occ (nuScenes 2Hz).
+        # For higher frame-rate datasets (e.g. T4 10Hz), use farther sweeps
+        # like [4, 6] to get comparable temporal baseline (~0.5s / ~0.7s).
+        self.warp_sweep_indices = warp_sweep_indices or [0, 1]
 
     def __call__(self, results):
         N = self.num_cams
@@ -762,7 +769,17 @@ class LoadMultiSweepImages:
         cur_cam2ego = np.stack(cur_cam2ego)  # [N, 4, 4]
         cur_cam2img = np.stack(cur_cam2img)  # [N, 4, 4]
 
-        # Compute ego2img for current frame: cam2img @ inv(cam2ego)
+        # T4 cameras have different shutter times, so each camera has a
+        # different ego2global.  We pick camera 0 as the reference ego frame
+        # and fold the per-camera ego motion into cam2ego so that all
+        # downstream code (rendering, feature sampling, Gaussian init) operates
+        # in a single consistent ego frame.
+        #   effective_cam2ego_n = inv(ref_e2g) @ e2g_n @ cam2ego_n
+        ref_ego2global_inv = np.linalg.inv(cur_ego2global[0])
+        for n in range(N):
+            cur_cam2ego[n] = ref_ego2global_inv @ cur_ego2global[n] @ cur_cam2ego[n]
+
+        # Compute ego2img for current frame: cam2img @ inv(effective_cam2ego)
         ego2img_list = []
         for n in range(N):
             ego2cam = np.linalg.inv(cur_cam2ego[n])
@@ -818,27 +835,39 @@ class LoadMultiSweepImages:
                 s_cam2ego = np.array(s_cam['cam2ego'], dtype=np.float32)
                 s_ego2global = np.array(s_cam['ego2global'], dtype=np.float32)
 
-                # Map current-ego points to sweep image:
-                # current ego -> global -> sweep ego -> sweep cam -> image.
+                # Map reference-ego points to sweep image:
+                # ref ego -> global -> sweep ego -> sweep cam -> image.
+                # Use cur_ego2global[0] (the reference) since the model's
+                # ego frame is aligned to camera 0's ego pose.
                 s_ego2img = (
                     s_c2i
                     @ np.linalg.inv(s_cam2ego)
                     @ np.linalg.inv(s_ego2global)
-                    @ cur_ego2global[n]
+                    @ cur_ego2global[0]
                 )
                 ego2img_list.append(s_ego2img)
 
-                # T = inv(s_cam2ego) @ inv(s_ego2global) @ cur_ego2global[n] @ cur_cam2ego[n]
+                # T maps current cam n frame → sweep cam frame, via reference ego.
+                # cur_cam2ego[n] already maps cam n → ref ego (after correction),
+                # so go ref ego → global → sweep ego → sweep cam.
                 T = (np.linalg.inv(s_cam2ego) @
                      np.linalg.inv(s_ego2global) @
-                     cur_ego2global[n] @
+                     cur_ego2global[0] @
                      cur_cam2ego[n])
                 t0_2_x_geo.append(T)
 
-        # Generate render_gt: current + two temporal frames (PG-Occ loss contract).
+        # Generate render_gt: current + two temporal frames for warp loss.
+        # Select sweep images/transforms by warp_sweep_indices (e.g. [4, 6]
+        # for 10Hz data to match the ~0.5s baseline of nuScenes 2Hz).
+        warp_imgs = []
+        warp_t0_2_x = []
+        for wi in self.warp_sweep_indices:
+            wi_clamped = min(wi, self.num_sweeps - 1)
+            warp_imgs.extend(sweep_imgs[wi_clamped * N : (wi_clamped + 1) * N])
+            warp_t0_2_x.extend(t0_2_x_geo[wi_clamped * N : (wi_clamped + 1) * N])
+
         render_gt_imgs = []
-        all_imgs = list(results['img'][:N]) + sweep_imgs[:2 * N]
-        for img in all_imgs:
+        for img in list(results['img'][:N]) + warp_imgs:
             img_u8 = img.astype(np.uint8) if img.max() > 1.0 else (img * 255).astype(np.uint8)
             resized = cv2.resize(img_u8, (self.render_w, self.render_h),
                                  interpolation=cv2.INTER_LINEAR)
@@ -849,7 +878,7 @@ class LoadMultiSweepImages:
 
         # Store computed arrays
         results['ego2img'] = np.stack(ego2img_list[:(1 + self.num_sweeps) * N])
-        results['t0_2_x_geo'] = np.stack(t0_2_x_geo[:2 * N])
+        results['t0_2_x_geo'] = np.stack(warp_t0_2_x)
         results['render_gt'] = np.stack(render_gt_imgs)
         results['cam2ego'] = cur_cam2ego  # [N, 4, 4] current frame only
 
@@ -1010,13 +1039,15 @@ def get_pgocc_train_transforms(
     num_sweeps=7,
     num_cams=5,
     num_views=5,
+    warp_sweep_indices=None,
 ):
     """Get PG-Occ training transforms."""
     return Compose([
         LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root, to_rgb=False),
         LoadMultiSweepImages(
             num_sweeps=num_sweeps, num_cams=num_cams,
-            render_h=render_h, render_w=render_w, data_root=data_root, to_rgb=False),
+            render_h=render_h, render_w=render_w, data_root=data_root, to_rgb=False,
+            warp_sweep_indices=warp_sweep_indices),
         ResizePGOccImages(target_size=input_size),
         LoadFeatMaps(
             data_root=depth_root, key='depth', apply_aug=False,
@@ -1038,13 +1069,15 @@ def get_pgocc_val_transforms(
     num_sweeps=7,
     num_cams=5,
     num_views=5,
+    warp_sweep_indices=None,
 ):
     """Get PG-Occ validation transforms (same pipeline, no random aug)."""
     return Compose([
         LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root, to_rgb=False),
         LoadMultiSweepImages(
             num_sweeps=num_sweeps, num_cams=num_cams,
-            render_h=render_h, render_w=render_w, data_root=data_root, to_rgb=False),
+            render_h=render_h, render_w=render_w, data_root=data_root, to_rgb=False,
+            warp_sweep_indices=warp_sweep_indices),
         ResizePGOccImages(target_size=input_size),
         LoadFeatMaps(
             data_root=depth_root, key='depth', apply_aug=False,
