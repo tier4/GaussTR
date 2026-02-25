@@ -317,6 +317,11 @@ def _load_png_as_array(path: str, depth_scale: float = None) -> np.ndarray:
 
     # Handle 16-bit depth PNGs (e.g., from Prior-Depth-Anything)
     if img.dtype == np.uint16 and depth_scale is not None:
+        # ~3% of PriorDA frames were encoded with scale=1000 instead of 650,
+        # detectable by saturated max value (65535 = 65.535m at scale=1000,
+        # vs 100.8m at scale=650 which rarely saturates for driving scenes).
+        if img.max() == 65535:
+            return img.astype(np.float32) / 1000.0
         return img.astype(np.float32) / depth_scale
 
     return img
@@ -897,6 +902,10 @@ class ResizePGOccImages:
             ego2img = np.matmul(ida_mat[None, ...], ego2img)
             results['ego2img'] = ego2img
 
+        # Store crop info for computing blind region in render space.
+        # The top crop_h/resize original rows have no backbone features.
+        results['backbone_crop_top_orig'] = crop_h / resize
+        results['orig_img_h'] = src_h
         results['img_shape'] = (self.target_h, self.target_w)
         return results
 
@@ -966,6 +975,14 @@ class PackPGOccInputs:
                     img_metas[key] = torch.from_numpy(val).float()
                 elif isinstance(val, torch.Tensor):
                     img_metas[key] = val.float()
+
+        # Compute which render rows have backbone coverage.
+        # Rows above this boundary have no backbone features (blind region).
+        if 'backbone_crop_top_orig' in results and 'orig_img_h' in results:
+            crop_top_orig = results['backbone_crop_top_orig']
+            orig_h = results['orig_img_h']
+            img_metas['backbone_valid_row'] = int(
+                crop_top_orig / orig_h * self.render_h)
 
         # Shape info needed by pad_multiple
         num_cams = self.num_cams

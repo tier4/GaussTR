@@ -124,7 +124,7 @@ class Project3D(nn.Module):
 
 
 def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, project_3d, k,
-                           num_cams=5):
+                           num_cams=5, valid_row=0):
     """Temporal depth warping loss with auto-masking.
 
     Args:
@@ -135,6 +135,7 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
         project_3d: Project3D module
         k: Camera intrinsics [N, 4, 4]
         num_cams: Number of cameras
+        valid_row: First render row with backbone feature coverage (0 = no masking)
 
     Returns:
         Scalar warping loss
@@ -180,5 +181,9 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
 
     combined = torch.cat((identity_reprojection_losses, reprojection_losses), dim=1)
     to_optimise, _ = torch.min(combined, dim=1)
+
+    # Exclude blind rows (no backbone features) from loss
+    if valid_row > 0:
+        to_optimise = to_optimise[:, valid_row:, :]
 
     return to_optimise.mean()
