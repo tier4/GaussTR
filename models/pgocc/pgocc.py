@@ -389,9 +389,13 @@ class PGOccLightning(pl.LightningModule):
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
                 total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos']
 
-            # Foundation depth loss (masked to backbone-visible region)
+            # Foundation depth loss (masked to backbone-visible region + alpha coverage).
+            # Alpha masking is critical: pixels with no Gaussian coverage have
+            # render_depth≈0.1 (clamped) and zero gsplat gradient, but contribute
+            # large constant SiLog values that dilute the gradient ~3x.
             depth_tgt = batch['depth'].clone().squeeze(0)  # [N, 1, Hd, Wd]
-            mask = (depth_tgt > 0.1) & (depth_tgt < 51.2)
+            render_alpha = render_results['alphas'].permute(0, 3, 1, 2)  # [N, 1, H, W]
+            mask = (depth_tgt > 0.1) & (depth_tgt < 51.2) & (render_alpha > 0.1)
             if valid_row > 0:
                 mask[:, :, :valid_row, :] = False
             mask.detach_()

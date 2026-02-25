@@ -153,12 +153,15 @@ def main(cfg: DictConfig) -> None:
     if cfg.get('use_rich_progress', True):
         callbacks.append(RichProgressBar())
 
-    # Logger
+    # Logger — use the absolute tracking URI from env (Hydra changes CWD, so relative paths break)
     logger = MLFlowLogger(
         experiment_name=cfg.get('experiment_name', 'pgocc_t4'),
-        tracking_uri=cfg.get('mlflow_tracking_uri', 'sqlite:///mlflow.db'),
+        tracking_uri=os.environ['MLFLOW_TRACKING_URI'],
         run_name=run_name,
-        artifact_location=cfg.get('mlflow_artifact_location', 'mlruns/artifacts'),
+        artifact_location=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'mlruns', 'mlflow_artifacts',
+        ),
         save_dir=None,
     )
 

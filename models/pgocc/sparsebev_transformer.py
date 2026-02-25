@@ -127,8 +127,10 @@ class SparseBEVSampling(nn.Module):
         sampling_offset = self.sampling_offset(query_feat)
         sampling_offset = sampling_offset.view(B, Q, self.num_groups * self.num_points, 3)
 
-        # Use bbox-based sampling (anisotropy disabled in original code)
-        sampling_points = make_sample_points_from_bbox(query_bbox, sampling_offset, self.pc_range)
+        if self.use_anisotropy_encoding and anisotropy_info is not None:
+            sampling_points = make_sample_points_from_3dgs(query_bbox, sampling_offset, anisotropy_info, self.pc_range)
+        else:
+            sampling_points = make_sample_points_from_bbox(query_bbox, sampling_offset, self.pc_range)
         sampling_points = sampling_points.reshape(B, Q, 1, self.num_groups, self.num_points, 3)
         sampling_points = sampling_points.expand(B, Q, self.num_frames, self.num_groups, self.num_points, 3)
 
