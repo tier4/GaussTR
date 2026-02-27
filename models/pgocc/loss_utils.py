@@ -203,14 +203,14 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
 
     # Apply per-pixel mask (ego car, sky, dynamic objects)
     if pixel_mask is not None:
-        # pixel_mask is [N, 1, H, W] — slice to match to_optimise shape
-        pm = pixel_mask[:num_cams].float()
+        # pixel_mask is [N, 1, H, W] — squeeze to [N, H, W] to match to_optimise [P*N, H, W]
+        pm = pixel_mask[:num_cams].squeeze(1).float()
         if valid_row > 0:
-            pm = pm[:, :, valid_row:, :]
-        # to_optimise may be [P*N, 1, H', W'] from cat across past frames
+            pm = pm[:, valid_row:, :]
+        # to_optimise is [P*N, H', W'] when multiple past frames
         if to_optimise.shape[0] > pm.shape[0]:
             num_past = to_optimise.shape[0] // pm.shape[0]
-            pm = pm.repeat(num_past, 1, 1, 1)
+            pm = pm.repeat(num_past, 1, 1)
         to_optimise = to_optimise * pm
         count = pm.sum().clamp(min=1.0)
         return to_optimise.sum() / count
