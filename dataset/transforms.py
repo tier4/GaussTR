@@ -1022,6 +1022,18 @@ class PackPGOccInputs:
 
         packed['img_metas'] = img_metas
 
+        # SAM3 semantic mask: [N_total, H, W] → pack current-frame only [N, 1, H, W]
+        if 'sam3_mask' in results:
+            sam3 = results['sam3_mask']  # [N_total, H, W] int64
+            packed['sam3_mask'] = sam3[:num_cams].unsqueeze(1)  # [N, 1, H, W]
+
+        # Sparse LiDAR GT depth: [N_total, H, W] → current-frame only [N, 1, H, W]
+        if 'gt_depth' in results:
+            gt_depth = results['gt_depth']  # [N_total, H, W] float32
+            if gt_depth.dim() == 3:
+                gt_depth = gt_depth.unsqueeze(1)
+            packed['gt_depth'] = gt_depth[:num_cams]  # [N, 1, H, W]
+
         for key in ['token', 'scene_token', 'timestamp', 'sample_idx']:
             if key in results:
                 packed[key] = results[key]
@@ -1033,6 +1045,8 @@ def get_pgocc_train_transforms(
     data_root='/mnt/nvme2/T4_datasets',
     depth_root='/mnt/nvme1/data/T4_datasets_priorda_depth',
     feats_root='/mnt/nvme3/T4_datasets_dinov3clip',
+    sam3_root='',
+    lidar_depth_root='',
     input_size=(256, 704),
     render_h=180,
     render_w=320,
@@ -1042,7 +1056,7 @@ def get_pgocc_train_transforms(
     warp_sweep_indices=None,
 ):
     """Get PG-Occ training transforms."""
-    return Compose([
+    transforms = [
         LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root, to_rgb=False),
         LoadMultiSweepImages(
             num_sweeps=num_sweeps, num_cams=num_cams,
@@ -1055,14 +1069,28 @@ def get_pgocc_train_transforms(
         LoadFeatMaps(
             data_root=feats_root, key='feats', apply_aug=False,
             use_chunk_subdirs=True),
-        PackPGOccInputs(num_cams=num_cams, render_h=render_h, render_w=render_w),
-    ])
+    ]
+
+    if sam3_root:
+        transforms.append(LoadFeatMaps(
+            data_root=sam3_root, key='sam3_mask', apply_aug=False,
+            use_chunk_subdirs=True, png_format=True))
+
+    if lidar_depth_root:
+        transforms.append(LoadFeatMaps(
+            data_root=lidar_depth_root, key='gt_depth', apply_aug=False,
+            use_chunk_subdirs=True))
+
+    transforms.append(PackPGOccInputs(num_cams=num_cams, render_h=render_h, render_w=render_w))
+    return Compose(transforms)
 
 
 def get_pgocc_val_transforms(
     data_root='/mnt/nvme2/T4_datasets',
     depth_root='/mnt/nvme1/data/T4_datasets_priorda_depth',
     feats_root='/mnt/nvme3/T4_datasets_dinov3clip',
+    sam3_root='',
+    lidar_depth_root='',
     input_size=(256, 704),
     render_h=180,
     render_w=320,
@@ -1071,7 +1099,11 @@ def get_pgocc_val_transforms(
     num_views=5,
     warp_sweep_indices=None,
 ):
-    """Get PG-Occ validation transforms (same pipeline, no random aug)."""
+    """Get PG-Occ validation transforms (same pipeline, no random aug).
+
+    Note: sam3_root and lidar_depth_root are accepted but not used during
+    validation — they're training-only supervision signals.
+    """
     return Compose([
         LoadMultiViewImages(to_float32=True, num_views=num_views, data_root=data_root, to_rgb=False),
         LoadMultiSweepImages(

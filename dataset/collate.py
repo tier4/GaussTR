@@ -184,7 +184,8 @@ def collate_pgocc(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
 
     # Keys that should be stacked into tensors
-    tensor_keys = {'img', 'depth', 'text_vision', 'render_gt', 't0_2_x_geo'}
+    tensor_keys = {'img', 'depth', 'text_vision', 'render_gt', 't0_2_x_geo',
+                   'sam3_mask', 'gt_depth'}
 
     collated = {}
 

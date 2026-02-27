@@ -43,18 +43,21 @@ from .callbacks import (
     VisualizationCallback,
     ValidationVisualizationCallback,
 )
-from .gaussian_viz import (
-    create_scatter_3d_plotly,
-    create_scatter_by_class_plotly,
-    create_density_bev,
-    plot_opacity_histogram,
-    plot_scale_distribution,
-    plot_depth_error_analysis,
-    plot_per_class_analysis,
-    create_gaussians_vs_voxels_comparison,
-    compute_gaussian_metrics,
-    generate_analysis_report,
-)
+try:
+    from .gaussian_viz import (
+        create_scatter_3d_plotly,
+        create_scatter_by_class_plotly,
+        create_density_bev,
+        plot_opacity_histogram,
+        plot_scale_distribution,
+        plot_depth_error_analysis,
+        plot_per_class_analysis,
+        create_gaussians_vs_voxels_comparison,
+        compute_gaussian_metrics,
+        generate_analysis_report,
+    )
+except ImportError:
+    pass
 
 __all__ = [
     # Color maps

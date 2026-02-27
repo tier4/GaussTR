@@ -1,0 +1,53 @@
+{
+  "description": "SAM3 16-class configuration for GaussTR. Static classes are used for temporal scene accumulation, dynamic classes are not.",
+  "num_classes": 16,
+  "num_prompts": 103,
+  "categories": {
+    "static": {
+      "description": "Static objects suitable for temporal scene accumulation",
+      "classes": [
+        {"id": 1, "name": "barrier", "prompts": ["barrier", "barricade", "guardrail", "concrete barrier", "metal barrier"]},
+        {"id": 8, "name": "traffic_cone", "prompts": ["traffic cone", "cone", "safety cone", "orange cone", "road cone"]},
+        {"id": 11, "name": "road", "prompts": ["road", "street", "highway", "roadway", "pavement", "asphalt", "roadmarking", "lane"]},
+        {"id": 12, "name": "sidewalk", "prompts": ["sidewalk", "walkway", "footpath", "pedestrian path", "curb"]},
+        {"id": 13, "name": "terrain", "prompts": ["grass", "terrain", "turf", "sand", "soil", "dirt", "gravel", "lawn", "mud", "ground"]},
+        {"id": 14, "name": "manmade", "prompts": ["building", "wall", "fence", "pole", "sign", "traffic sign", "street light", "light pole", "bridge", "billboard", "structure", "tower", "post", "railing"]},
+        {"id": 15, "name": "vegetation", "prompts": ["tree", "bush", "vegetation", "plants", "shrub", "hedge", "foliage", "leaves"]},
+        {"id": 16, "name": "sky", "prompts": ["sky", "clouds", "clear sky", "blue sky"]}
+      ],
+      "class_ids": [1, 8, 11, 12, 13, 14, 15, 16]
+    },
+    "dynamic": {
+      "description": "Dynamic/moving objects not suitable for temporal accumulation",
+      "classes": [
+        {"id": 2, "name": "bicycle", "prompts": ["bicycle", "bike", "bicyclist", "cyclist"]},
+        {"id": 3, "name": "bus", "prompts": ["bus", "school bus", "city bus", "coach"]},
+        {"id": 4, "name": "car", "prompts": ["car", "sedan", "van", "suv", "vehicle", "automobile", "taxi"]},
+        {"id": 5, "name": "construction_vehicle", "prompts": ["excavator", "crane", "bulldozer", "construction vehicle", "forklift", "loader"]},
+        {"id": 6, "name": "motorcycle", "prompts": ["motorcycle", "scooter", "motorbike", "motorcyclist", "moped"]},
+        {"id": 7, "name": "pedestrian", "prompts": ["person", "pedestrian", "people", "human", "adult", "child", "man", "woman"]},
+        {"id": 9, "name": "trailer", "prompts": ["trailer", "semi-trailer", "cargo trailer", "container trailer"]},
+        {"id": 10, "name": "truck", "prompts": ["truck", "lorry", "pickup truck", "delivery truck", "semi truck", "freight truck"]}
+      ],
+      "class_ids": [2, 3, 4, 5, 6, 7, 9, 10]
+    }
+  },
+  "class_id_to_type": {
+    "1": "static",
+    "2": "dynamic",
+    "3": "dynamic",
+    "4": "dynamic",
+    "5": "dynamic",
+    "6": "dynamic",
+    "7": "dynamic",
+    "8": "static",
+    "9": "dynamic",
+    "10": "dynamic",
+    "11": "static",
+    "12": "static",
+    "13": "static",
+    "14": "static",
+    "15": "static",
+    "16": "static"
+  }
+}

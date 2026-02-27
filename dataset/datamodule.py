@@ -75,6 +75,8 @@ class GaussTRDataModule(pl.LightningDataModule):
         render_w: int = 320,
         num_sweeps: int = 7,
         warp_sweep_indices: list = None,
+        sam3_root: str = '',
+        lidar_depth_root: str = '',
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -108,6 +110,8 @@ class GaussTRDataModule(pl.LightningDataModule):
         self.render_w = render_w
         self.num_sweeps = num_sweeps
         self.warp_sweep_indices = warp_sweep_indices
+        self.sam3_root = sam3_root
+        self.lidar_depth_root = lidar_depth_root
 
         self.train_dataset = None
         self.val_dataset = None
@@ -213,6 +217,8 @@ class GaussTRDataModule(pl.LightningDataModule):
             data_root=self.data_root,
             depth_root=self.depth_root,
             feats_root=self.feats_root,
+            sam3_root=self.sam3_root,
+            lidar_depth_root=self.lidar_depth_root,
             input_size=self.input_size,
             render_h=self.render_h,
             render_w=self.render_w,

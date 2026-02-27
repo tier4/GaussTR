@@ -124,7 +124,7 @@ class Project3D(nn.Module):
 
 
 def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, project_3d, k,
-                           num_cams=5, valid_row=0):
+                           num_cams=5, valid_row=0, min_translation=0.5, pixel_mask=None):
     """Temporal depth warping loss with auto-masking.
 
     Args:
@@ -136,9 +136,14 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
         k: Camera intrinsics [N, 4, 4]
         num_cams: Number of cameras
         valid_row: First render row with backbone feature coverage (0 = no masking)
+        min_translation: Skip warp for frames with ego motion below this (meters).
+            T4 10Hz data has ~35% stationary samples where warping provides no
+            gradient signal. Filtering these prevents identity loss from dominating.
+        pixel_mask: Optional [N, 1, H, W] bool mask. True = valid pixel for loss.
+            Used to exclude ego car, sky, and dynamic objects from warp loss.
 
     Returns:
-        Scalar warping loss
+        Scalar warping loss, or zero tensor if all frames are stationary
     """
     reprojection_losses = []
     identity_reprojection_losses = []
@@ -154,9 +159,15 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
 
     num_past_frames = int(len(tn_img) / num_cams)
     for past_i in range(num_past_frames):
-        pix_coords, _ = project_3d(
-            cam_points, k,
-            t0_2_tn[0][num_cams * past_i:num_cams * (past_i + 1)].float())
+        T_slice = t0_2_tn[0][num_cams * past_i:num_cams * (past_i + 1)].float()
+
+        # Skip frames with insufficient ego motion — warping produces no useful
+        # gradient when the camera barely moved (identity always wins).
+        avg_translation = T_slice[:, :3, 3].norm(dim=1).mean()
+        if avg_translation < min_translation:
+            continue
+
+        pix_coords, _ = project_3d(cam_points, k, T_slice)
 
         warped_img = F.grid_sample(
             tn_img[past_i * num_cams:(past_i + 1) * num_cams],
@@ -170,6 +181,10 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
         identity_reprojection_loss = compute_reprojection_loss(
             tn_img[past_i * num_cams:(past_i + 1) * num_cams], t0_img)
         identity_reprojection_losses.append(identity_reprojection_loss)
+
+    # All frames were stationary — return zero loss (no gradient)
+    if len(reprojection_losses) == 0:
+        return torch.tensor(0.0, device=depths.device, requires_grad=True)
 
     reprojection_losses = torch.cat(reprojection_losses, dim=0)
     identity_reprojection_losses = torch.cat(identity_reprojection_losses, dim=0)
@@ -185,5 +200,19 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
     # Exclude blind rows (no backbone features) from loss
     if valid_row > 0:
         to_optimise = to_optimise[:, valid_row:, :]
+
+    # Apply per-pixel mask (ego car, sky, dynamic objects)
+    if pixel_mask is not None:
+        # pixel_mask is [N, 1, H, W] — slice to match to_optimise shape
+        pm = pixel_mask[:num_cams].float()
+        if valid_row > 0:
+            pm = pm[:, :, valid_row:, :]
+        # to_optimise may be [P*N, 1, H', W'] from cat across past frames
+        if to_optimise.shape[0] > pm.shape[0]:
+            num_past = to_optimise.shape[0] // pm.shape[0]
+            pm = pm.repeat(num_past, 1, 1, 1)
+        to_optimise = to_optimise * pm
+        count = pm.sum().clamp(min=1.0)
+        return to_optimise.sum() / count
 
     return to_optimise.mean()

@@ -4,9 +4,12 @@ Combines ResNet50+FPN backbone with SparseGaussiansDecoder for self-supervised
 3D occupancy prediction from multi-view cameras using Gaussian splatting.
 """
 
+import json
 import math
 import os
 
+import cv2
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -15,7 +18,7 @@ from torchvision.models import resnet50
 
 from .fpn import FPN
 from .sparse_gaussians_decoder import SparseGaussiansDecoder
-from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss
+from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss, get_gt_loss
 from .loss_utils import BackprojectDepth, Project3D, calc_time_warping_loss
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
@@ -52,6 +55,11 @@ class PGOccLightning(pl.LightningModule):
         ov_dim: int = 768,
         # Losses
         loss_weights: dict = None,
+        warp_warmup_epochs: int = 2,
+        # Masking
+        ego_car_mask_dir: str = "",
+        ego_car_mask_map: dict = None,
+        sam3_class_config: str = "",
         # Evaluation
         density_threshold: float = 0.04,
         text_protos: str = "",
@@ -77,6 +85,8 @@ class PGOccLightning(pl.LightningModule):
         size_divisor: int = 32,
         mean: list = None,
         std: list = None,
+        # Camera names (ordered)
+        camera_names: list = None,
         **kwargs,
     ):
         super().__init__()
@@ -97,12 +107,18 @@ class PGOccLightning(pl.LightningModule):
             mean = [123.675, 116.28, 103.53]
         if std is None:
             std = [58.395, 57.12, 57.375]
+        if camera_names is None:
+            camera_names = [
+                "CAM_FRONT_WIDE", "CAM_FRONT_RIGHT_WIDE", "CAM_FRONT_LEFT_WIDE",
+                "CAM_BACK_LEFT_WIDE", "CAM_BACK_RIGHT_WIDE",
+            ]
 
         self.pc_range = pc_range
         self.occ_size = occ_size
         self.num_cams = num_cams
         self.num_frames = num_frames
         self.loss_weights = loss_weights
+        self.warp_warmup_epochs = warp_warmup_epochs
         self.density_threshold = density_threshold
         self.render_conf = dict(render_h=render_h, render_w=render_w)
         self.img_color_aug = img_color_aug
@@ -121,6 +137,17 @@ class PGOccLightning(pl.LightningModule):
         # Image normalization
         self.register_buffer('img_mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('img_std', torch.tensor(std).view(1, 3, 1, 1))
+
+        # === Ego car masks ===
+        # Pre-computed binary masks for cameras where the ego car bonnet is visible.
+        # Loaded once at init, resized to render resolution, registered as buffers.
+        self._load_ego_car_masks(
+            ego_car_mask_dir, ego_car_mask_map or {}, camera_names,
+            render_h, render_w, num_cams)
+
+        # === SAM3 semantic class config ===
+        # Load class IDs for sky and dynamic objects from config file.
+        self._load_sam3_class_config(sam3_class_config)
 
         # Augmentation
         if use_grid_mask:
@@ -171,6 +198,76 @@ class PGOccLightning(pl.LightningModule):
             filter_gaussians=filter_gaussians,
             opacity_thresh=opacity_thresh, sigma_factor=sigma_factor,
         )
+
+    def _load_ego_car_masks(self, mask_dir, mask_map, camera_names, render_h, render_w, num_cams):
+        """Load ego car masks and register as a buffer [N, 1, Rh, Rw] bool."""
+        # Build per-camera mask: True = valid pixel, False = ego car
+        masks = []
+        for i in range(num_cams):
+            cam_name = camera_names[i] if i < len(camera_names) else f"cam_{i}"
+            mask_file = mask_map.get(cam_name, "")
+            if mask_file and mask_dir and os.path.exists(os.path.join(mask_dir, mask_file)):
+                mask_path = os.path.join(mask_dir, mask_file)
+                raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                # Mask PNGs: 255 = ego car, 0 = background → invert to True = valid
+                resized = cv2.resize(raw, (render_w, render_h), interpolation=cv2.INTER_NEAREST)
+                mask_tensor = torch.from_numpy(resized).bool()
+                masks.append(~mask_tensor)  # True = valid, False = ego car
+            else:
+                # No ego car visible in this camera → all valid
+                masks.append(torch.ones(render_h, render_w, dtype=torch.bool))
+
+        # [N, 1, Rh, Rw] bool
+        ego_mask = torch.stack(masks).unsqueeze(1)
+        self.register_buffer('ego_car_mask', ego_mask)
+
+    def _load_sam3_class_config(self, config_path):
+        """Load SAM3 class IDs for sky and dynamic object classes."""
+        if config_path and os.path.exists(config_path):
+            with open(config_path) as f:
+                cfg = json.load(f)
+            sky_ids = []
+            dynamic_ids = []
+            for cat_key, cat_val in cfg['categories'].items():
+                for cls in cat_val['classes']:
+                    if cls['name'] == 'sky':
+                        sky_ids.append(cls['id'])
+                    elif cat_key == 'dynamic':
+                        dynamic_ids.append(cls['id'])
+            self._sam3_sky_ids = sky_ids or [16]
+            self._sam3_dynamic_ids = dynamic_ids or [2, 3, 4, 5, 6, 7, 9, 10]
+        else:
+            # Hardcoded fallback matching T4 SAM3 classes
+            self._sam3_sky_ids = [16]
+            self._sam3_dynamic_ids = [2, 3, 4, 5, 6, 7, 9, 10]
+
+    def _build_sam3_masks(self, sam3_mask):
+        """Build per-loss masks from SAM3 semantic labels.
+
+        Args:
+            sam3_mask: [N, 1, H_orig, W_orig] int64 SAM3 class labels
+
+        Returns:
+            sky_mask: [N, 1, Rh, Rw] bool — True = not sky
+            dynamic_mask: [N, 1, Rh, Rw] bool — True = not dynamic object
+        """
+        rh, rw = self.render_conf['render_h'], self.render_conf['render_w']
+        # Resize to render resolution using nearest-neighbor
+        sam3_render = F.interpolate(
+            sam3_mask.float(), size=(rh, rw), mode='nearest').long()  # [N, 1, Rh, Rw]
+
+        # Sky mask: True where NOT sky
+        sky_mask = torch.ones_like(sam3_render, dtype=torch.bool)
+        for sid in self._sam3_sky_ids:
+            sky_mask &= (sam3_render != sid)
+
+        # Dynamic mask: True where NOT dynamic object
+        dynamic_mask = torch.ones_like(sam3_render, dtype=torch.bool)
+        dynamic_ids = torch.tensor(self._sam3_dynamic_ids, device=sam3_render.device)
+        for did in dynamic_ids:
+            dynamic_mask &= (sam3_render != did)
+
+        return sky_mask, dynamic_mask
 
     def _build_backbone(self, frozen_stages, pretrained_path):
         """Build ResNet50 backbone with optional COCO pretrained weights."""
@@ -347,6 +444,35 @@ class PGOccLightning(pl.LightningModule):
         # For T4 (1860x2880 → 256x704), the top ~43% of render rows are blind.
         valid_row = img_metas[0].get('backbone_valid_row', 0)
 
+        # === Build per-loss pixel masks ===
+        ego_mask = self.ego_car_mask.to(self.device)  # [N, 1, Rh, Rw] bool
+
+        # SAM3 semantic masks (sky + dynamic object exclusion)
+        sam3_mask = batch.get('sam3_mask')
+        if sam3_mask is not None:
+            sam3_mask = sam3_mask.squeeze(0).to(self.device)  # [N, 1, H, W]
+            sky_mask, dynamic_mask = self._build_sam3_masks(sam3_mask)
+            # Warp mask: exclude ego car + sky + dynamic objects
+            warp_pixel_mask = ego_mask & sky_mask & dynamic_mask
+            # Depth mask: exclude ego car + sky (dynamic objects have valid depth)
+            depth_pixel_mask = ego_mask & sky_mask
+            # OV mask: exclude ego car only (sky is a valid semantic class)
+            ov_pixel_mask = ego_mask
+        else:
+            warp_pixel_mask = ego_mask
+            depth_pixel_mask = ego_mask
+            ov_pixel_mask = ego_mask
+
+        # Smooth per-step warp warmup (replaces epoch-based jumps)
+        if self.warp_warmup_epochs > 0:
+            total_steps = self.trainer.estimated_stepping_batches
+            max_epochs = self.trainer.max_epochs
+            steps_per_epoch = max(1, total_steps // max(1, max_epochs))
+            warp_warmup_steps = self.warp_warmup_epochs * steps_per_epoch
+            warp_factor = min(1.0, self.training_iter / max(1, warp_warmup_steps))
+        else:
+            warp_factor = 1.0
+
         for i, gaussian in enumerate(gau_preds):
             # Apply PCA to predicted OV features
             if gaussian.ovs is not None:
@@ -359,50 +485,88 @@ class PGOccLightning(pl.LightningModule):
             render_depths = render_results['depth'].permute(0, 3, 1, 2)
             render_depths = render_depths.clamp(min=0.1, max=80.0)
 
-            # Temporal depth warping loss
+            # Temporal depth warping loss (with smooth warmup + pixel masking)
             loss_warp = calc_time_warping_loss(
                 render_depths[0:self.num_cams],
                 batch['t0_2_x_geo'], batch['render_gt'],
                 self.backproject_depth, self.project_3d, K,
-                num_cams=self.num_cams, valid_row=valid_row)
+                num_cams=self.num_cams, valid_row=valid_row,
+                pixel_mask=warp_pixel_mask)
             loss_dict[f'warp_{i}'] = loss_warp.item()
-            total_loss = total_loss + loss_warp * self.loss_weights['depth_warping']
+            total_loss = total_loss + loss_warp * self.loss_weights['depth_warping'] * warp_factor
 
-            # OV feature losses (masked to backbone-visible region)
+            # OV feature losses (masked to backbone-visible region + ego mask)
             if gaussian.ovs is not None:
                 ov_feature = render_results['ov_feature'].unsqueeze(0)  # [1, N, Rh, Rw, D]
 
-                # Exclude blind rows from OV supervision
-                ov_feat_vis = ov_feature[:, :, valid_row:, :, :]
-                ov_tgt_vis = ov_tgt_feature[:, :, valid_row:, :, :]
+                # Build OV spatial mask: ego car + valid_row
+                ov_mask_spatial = ov_pixel_mask.float()  # [N, 1, Rh, Rw]
+                if valid_row > 0:
+                    ov_mask_spatial[:, :, :valid_row, :] = 0.0
 
-                # MSE loss
-                loss_ov_mse = F.mse_loss(ov_feat_vis, ov_tgt_vis)
+                # Apply mask to OV features: [1, N, Rh, Rw, 1]
+                ov_mask_5d = ov_mask_spatial.unsqueeze(0).permute(0, 1, 3, 4, 2)  # [1, N, Rh, Rw, 1]
+
+                # MSE loss (masked)
+                ov_diff_sq = (ov_feature - ov_tgt_feature) ** 2
+                ov_diff_masked = ov_diff_sq * ov_mask_5d
+                ov_count = ov_mask_5d.sum().clamp(min=1.0) * D
+                loss_ov_mse = ov_diff_masked.sum() / ov_count
                 loss_dict[f'ov_mse_{i}'] = loss_ov_mse.item()
                 total_loss = total_loss + loss_ov_mse * self.loss_weights['ov_mse']
 
-                # Cosine similarity loss
-                ov_normed = ov_feat_vis / (ov_feat_vis.norm(dim=-1, keepdim=True) + 1e-8)
-                tgt_normed = ov_tgt_vis / (ov_tgt_vis.norm(dim=-1, keepdim=True) + 1e-8)
-                loss_ov_cos = 1.0 - torch.nanmean(
-                    F.cosine_similarity(ov_normed.reshape(-1, D), tgt_normed.reshape(-1, D)))
+                # Cosine similarity loss (masked)
+                ov_normed = ov_feature / (ov_feature.norm(dim=-1, keepdim=True) + 1e-8)
+                tgt_normed = ov_tgt_feature / (ov_tgt_feature.norm(dim=-1, keepdim=True) + 1e-8)
+                cos_sim = F.cosine_similarity(
+                    ov_normed.reshape(-1, D), tgt_normed.reshape(-1, D))
+                cos_mask_flat = ov_mask_5d.squeeze(-1).reshape(-1)
+                cos_count = cos_mask_flat.sum().clamp(min=1.0)
+                loss_ov_cos = 1.0 - (cos_sim * cos_mask_flat).sum() / cos_count
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
                 total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos']
 
-            # Foundation depth loss (masked to backbone-visible region)
+            # Foundation depth loss (masked: ego car + sky + valid_row)
             depth_tgt = batch['depth'].clone().squeeze(0)  # [N, 1, Hd, Wd]
             mask = (depth_tgt > 0.1) & (depth_tgt < 51.2)
             if valid_row > 0:
                 mask[:, :, :valid_row, :] = False
+            # Apply ego + sky mask to foundation depth
+            mask = mask & depth_pixel_mask
             mask.detach_()
             loss_depth = get_depth_loss(render_depths, depth_tgt, mask)
             loss_dict[f'depth_{i}'] = loss_depth.item()
             total_loss = total_loss + loss_depth * self.loss_weights['depth_foundation']
 
+            # Sparse LiDAR GT depth loss
+            if 'gt_depth' in batch and 'depth_gt' in self.loss_weights:
+                gt_depth = batch['gt_depth'].squeeze(0).to(self.device)  # [N, 1, H, W]
+                gt_mask = (gt_depth > 0.1) & (gt_depth < 80.0)
+                # Apply ego + sky mask at original resolution
+                if sam3_mask is not None:
+                    gt_sky_mask = torch.ones_like(sam3_mask, dtype=torch.bool)
+                    for sid in self._sam3_sky_ids:
+                        gt_sky_mask &= (sam3_mask != sid)
+                    gt_mask = gt_mask & gt_sky_mask
+                # Ego mask at original resolution
+                ego_orig = F.interpolate(
+                    ego_mask.float(), size=gt_depth.shape[-2:], mode='nearest').bool()
+                gt_mask = gt_mask & ego_orig
+                gt_mask.detach_()
+                loss_gt = get_gt_loss(render_depths, gt_depth, gt_mask)
+                loss_dict[f'depth_gt_{i}'] = loss_gt.item()
+                total_loss = total_loss + loss_gt * self.loss_weights['depth_gt']
+
         # Log losses
         self.log('train_loss', total_loss, prog_bar=True, sync_dist=True)
+        self.log('train/warp_factor', warp_factor, sync_dist=True)
         for k, v in loss_dict.items():
             self.log(f'train/{k}', v, sync_dist=True)
+
+        # Log mask coverage stats (periodically)
+        if batch_idx % 100 == 0:
+            warp_coverage = warp_pixel_mask.float().mean().item()
+            self.log('train/warp_mask_coverage', warp_coverage, sync_dist=True)
 
         return total_loss
 
@@ -432,13 +596,16 @@ class PGOccLightning(pl.LightningModule):
         # Compute class similarity via text prototype embeddings
         class_sim = torch.einsum('bnd,dm->bnm', gaussian.ovs, self.text_proto_embeds)
 
+        # Clamp scales to avoid singular covariance matrices in voxelizer
+        scales = gaussian.scales.clamp(min=1e-4)
+
         # Voxelize
         density, grid_feats = voxelizer(
             means3d=gaussian.means,
             opacities=gaussian.opacities,
             features=class_sim,
             rotations=gaussian.rotations,
-            scales=gaussian.scales,
+            scales=scales,
         )
 
         # Semantic predictions

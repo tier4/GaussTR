@@ -121,3 +121,24 @@ def get_depth_loss(depth_render, depth, mask):
     l1_loss = F.l1_loss(depth_render[mask], depth[mask])
 
     return silog_loss * 0.15 + l1_loss * 0.85
+
+
+def get_gt_loss(depth_render, depth_gt, mask):
+    """Sparse LiDAR GT depth loss (SiLog only, upsampled to original resolution).
+
+    Matches reference PG-Occ get_gt_loss: upsample rendered depth to GT resolution
+    and compute SiLog loss against sparse LiDAR points.
+
+    Args:
+        depth_render: Rendered depth [N, 1, Rh, Rw] at render resolution
+        depth_gt: Sparse LiDAR depth [N, 1, H_orig, W_orig] at original resolution
+        mask: Valid pixel mask [N, 1, H_orig, W_orig] bool
+
+    Returns:
+        Scalar SiLog loss
+    """
+    h, w = depth_gt.shape[-2:]
+    depth_up = F.interpolate(
+        depth_render.float(), size=(h, w), mode='bilinear', align_corners=False)
+    silog = SiLogLoss(variance_focus=0.85)
+    return silog(depth_up, depth_gt, mask.to(torch.bool))

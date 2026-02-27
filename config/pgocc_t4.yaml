@@ -50,10 +50,20 @@ model:
 
   # Losses
   loss_weights:
-    depth_warping: 10.0
+    depth_warping: 5.0     # Reduced from 10.0 — limit warp dominance to ~40%
     ov_mse: 10.0
     ov_cos: 1.0
-    depth_foundation: 0.5
+    depth_foundation: 1.0
+    depth_gt: 0.5          # Sparse LiDAR GT (SiLog only)
+  warp_warmup_epochs: 3    # Smooth per-step ramp over 3 epochs
+
+  # Masking — ego car bonnet + SAM3 semantic classes
+  ego_car_mask_dir: "assets/ego_car_masks"
+  ego_car_mask_map:
+    CAM_FRONT_WIDE: "front_mask_448x800.png"
+    CAM_BACK_LEFT_WIDE: "back_left_mask_448x800.png"
+    CAM_BACK_RIGHT_WIDE: "back_right_mask_448x800.png"
+  sam3_class_config: "assets/sam3_class_config.json"
 
   # Evaluation
   density_threshold: 0.04
@@ -76,11 +86,19 @@ model:
   min_lr_ratio: 0.001
 
   # Augmentation
-  use_grid_mask: false
+  use_grid_mask: true     # Enable GridMask — helps with limited T4 diversity
   img_color_aug: true
   size_divisor: 32
   mean: [123.675, 116.28, 103.53]
   std: [58.395, 57.12, 57.375]
+
+  # Camera names (must match data.camera_names order)
+  camera_names:
+    - "CAM_FRONT_WIDE"
+    - "CAM_FRONT_RIGHT_WIDE"
+    - "CAM_FRONT_LEFT_WIDE"
+    - "CAM_BACK_LEFT_WIDE"
+    - "CAM_BACK_RIGHT_WIDE"
 
 data:
   data_root: "/mnt/nvme2/T4_datasets"
@@ -88,6 +106,8 @@ data:
   val_ann_file: "/mnt/nvme2/T4_processed/t4_infos_val_sweep.pkl"
   depth_root: "/mnt/nvme1/data/T4_datasets_priorda_depth"
   feats_root: "/mnt/nvme3/T4_datasets_dinov3clip"
+  sam3_root: "/mnt/nvme3/T4_datasets_sam3"
+  lidar_depth_root: "/mnt/nvme3/T4_datasets_lidar_depth"
 
   # Image resolution
   input_size: [256, 704]  # H, W (PG-Occ default)
@@ -122,7 +142,7 @@ trainer:
   devices: 8
   strategy: "ddp_find_unused_parameters_true"
   precision: "bf16-mixed"
-  gradient_clip_val: 350.0
+  gradient_clip_val: 35.0       # Reduced from 350.0 — match reference PG-Occ
   gradient_clip_algorithm: "norm"
   accumulate_grad_batches: 1
   val_check_interval: 1.0

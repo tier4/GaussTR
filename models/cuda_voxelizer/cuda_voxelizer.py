@@ -273,6 +273,10 @@ class CUDAVoxelizer(nn.Module):
         # Compute covariance: Cov = M @ M^T = R @ S² @ R^T
         Cov = torch.bmm(M, M.transpose(-1, -2))
 
+        # Regularize covariance to prevent singular matrices from degenerate
+        # Gaussians (zero quaternions or near-zero scales during early training).
+        Cov = Cov + 1e-3 * torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+
         # Invert covariance to get precision matrix (GaussianFormer style)
         # Use FP32 on GPU for numerical stability (disable autocast to avoid FP16)
         with torch.amp.autocast('cuda', enabled=False):
