@@ -542,6 +542,11 @@ class PGOccLightning(pl.LightningModule):
             if 'gt_depth' in batch and 'depth_gt' in self.loss_weights:
                 gt_depth = batch['gt_depth'].squeeze(0).to(self.device)  # [N, 1, H, W]
                 gt_mask = (gt_depth > 0.1) & (gt_depth < 80.0)
+                # Mask blind region (no backbone features → garbage rendered depth)
+                if valid_row > 0:
+                    gt_h = gt_depth.shape[-2]
+                    valid_row_orig = int(valid_row / self.render_conf['render_h'] * gt_h)
+                    gt_mask[:, :, :valid_row_orig, :] = False
                 # Apply ego + sky mask at original resolution
                 if sam3_mask is not None:
                     gt_sky_mask = torch.ones_like(sam3_mask, dtype=torch.bool)
