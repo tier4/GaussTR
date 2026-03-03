@@ -46,8 +46,10 @@ class SparseGaussiansDecoder(nn.Module):
                  num_queries=None,
                  ov_dim=768,
                  restrict_xyz=True,
-                 use_anisotropy_encoding=True):
+                 use_anisotropy_encoding=True,
+                 scale_range=(0.0, 2.0)):
         super().__init__()
+        self.scale_range = scale_range
 
         self.embed_dims = embed_dims
         self.num_frames = num_frames
@@ -116,13 +118,15 @@ class SparseGaussiansDecoder(nn.Module):
         for layer in self.decoder_layers:
             layer.init_weights()
 
-    def query_2_gaussian(self, gau_pred, scale_range=(0.0, 6.4)):
+    def query_2_gaussian(self, gau_pred, scale_range=None):
         """Map 11D predictions to Gaussian parameters.
 
         Args:
             gau_pred: [B, Q, 11] raw predictions
-            scale_range: (min, max) scale range (original: 0.0, 6.4)
+            scale_range: (min, max) scale range. Default: self.scale_range
         """
+        if scale_range is None:
+            scale_range = self.scale_range
         gau_pred = torch.nan_to_num(gau_pred, nan=0.0)
 
         gau_xyz_sigmoid = 2 * torch.sigmoid(gau_pred[..., 0:3]) - 1

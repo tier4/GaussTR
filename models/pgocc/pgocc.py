@@ -480,6 +480,8 @@ class PGOccLightning(pl.LightningModule):
 
             render_depths = render_results['depth'].permute(0, 3, 1, 2)
             render_depths = render_depths.clamp(min=0.1, max=80.0)
+            render_alphas = render_results['alphas'].permute(0, 3, 1, 2)  # [N, 1, H, W]
+            alpha_mask = (render_alphas > 0.1).detach()  # only supervise depth where Gaussians render
 
             # Temporal depth warping loss (with smooth warmup + pixel masking)
             do_warp_diag = (i == 0 and batch_idx % 50 == 0)
@@ -555,13 +557,13 @@ class PGOccLightning(pl.LightningModule):
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
                 total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos']
 
-            # Foundation depth loss (masked: ego car + sky + valid_row)
+            # Foundation depth loss (masked: ego car + sky + valid_row + alpha)
             depth_tgt = batch['depth'].clone().squeeze(0)  # [N, 1, Hd, Wd]
             mask = (depth_tgt > 0.1) & (depth_tgt < 51.2)
             if valid_row > 0:
                 mask[:, :, :valid_row, :] = False
-            # Apply ego + sky mask to foundation depth
-            mask = mask & depth_pixel_mask
+            # Apply ego + sky mask + alpha mask to foundation depth
+            mask = mask & depth_pixel_mask & alpha_mask
             mask.detach_()
             loss_depth = get_depth_loss(render_depths, depth_tgt, mask)
             loss_dict[f'depth_{i}'] = loss_depth.item()
@@ -577,7 +579,7 @@ class PGOccLightning(pl.LightningModule):
                 # Apply sky + ego masks (already at render resolution)
                 if sky_mask is not None:
                     gt_mask = gt_mask & sky_mask
-                gt_mask = gt_mask & ego_mask
+                gt_mask = gt_mask & ego_mask & alpha_mask
                 gt_mask.detach_()
                 loss_gt = get_gt_loss(render_depths, gt_depth, gt_mask)
                 loss_dict[f'depth_gt_{i}'] = loss_gt.item()

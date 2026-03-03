@@ -39,16 +39,20 @@ def batch_splatting_render(pc, w2c, Ks, render_conf, inference=False):
     else:
         semantics = torch.zeros_like(means)
 
+    near_plane = render_conf.get('near_plane', 2.0)
+
     if inference:
         render_results, alphas, meta = rasterization(
             means, quats, scales, opacities, semantics, w2c, Ks,
             width, height, packed=False, sparse_grad=False, render_mode="ED",
+            near_plane=near_plane,
         )
         return {"depth": render_results[..., -1:], "alphas": alphas}
 
     render_results, alphas, meta = rasterization(
         means, quats, scales, opacities, semantics, w2c, Ks,
         width, height, packed=False, sparse_grad=False, render_mode="RGB+ED",
+        near_plane=near_plane,
     )
 
     if pc.ovs is not None:
