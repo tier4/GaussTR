@@ -186,6 +186,7 @@ def main(cfg: DictConfig) -> None:
         accumulate_grad_batches=trainer_cfg.get('accumulate_grad_batches', 1),
         val_check_interval=trainer_cfg.get('val_check_interval', 1.0),
         check_val_every_n_epoch=trainer_cfg.get('check_val_every_n_epoch', 1),
+        limit_train_batches=trainer_cfg.get('limit_train_batches', 1.0),
         limit_val_batches=trainer_cfg.get('limit_val_batches', 0),
         log_every_n_steps=trainer_cfg.get('log_every_n_steps', 50),
         enable_progress_bar=True,

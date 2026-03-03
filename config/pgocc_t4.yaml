@@ -50,12 +50,12 @@ model:
 
   # Losses
   loss_weights:
-    depth_warping: 10.0    # Reverted — was working at 10.0 in converging run
+    depth_warping: 5.0     # Halved: warp only fires on ~45% of T4 samples (55% stationary)
     ov_mse: 10.0
     ov_cos: 1.0
-    depth_foundation: 0.5  # Reverted — 1.0 didn't help due to grad clipping
-    depth_gt: 0.05         # SiLog has built-in ×10 multiplier; 0.5 was 10× too hot
-  warp_warmup_epochs: 1    # 3 was too long — delays critical warp signal
+    depth_foundation: 1.0  # Increased: SAM3 sky masking now prevents garbage gradients
+    depth_gt: 0.5          # Increased: SAM3+ego masking filters invalid GT depth pixels
+  warp_warmup_epochs: 2    # Moderate warmup — warp works when it fires (59% wins masked)
 
   # Masking — ego car bonnet + SAM3 semantic classes
   ego_car_mask_dir: "assets/ego_car_masks"
@@ -86,7 +86,7 @@ model:
   min_lr_ratio: 0.001
 
   # Augmentation
-  use_grid_mask: false    # Disabled — adds noise when combined with gradient clipping
+  use_grid_mask: true     # Enabled — helps with limited T4 scene diversity
   img_color_aug: true
   size_divisor: 32
   mean: [123.675, 116.28, 103.53]
@@ -142,7 +142,7 @@ trainer:
   devices: 8
   strategy: "ddp_find_unused_parameters_true"
   precision: "bf16-mixed"
-  gradient_clip_val: 350.0      # Reverted — 35 causes gradient starvation with added loss terms
+  gradient_clip_val: 35.0       # Reference value — SAM3 masking removes garbage gradient sources
   gradient_clip_algorithm: "norm"
   accumulate_grad_batches: 1
   val_check_interval: 1.0

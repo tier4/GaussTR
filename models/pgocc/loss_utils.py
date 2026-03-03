@@ -124,11 +124,12 @@ class Project3D(nn.Module):
 
 
 def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, project_3d, k,
-                           num_cams=5, valid_row=0, min_translation=0.5, pixel_mask=None):
+                           num_cams=5, valid_row=0, min_translation=0.5, pixel_mask=None,
+                           return_diagnostics=False):
     """Temporal depth warping loss with auto-masking.
 
     Args:
-        depths: Predicted depth maps [N, H, W]
+        depths: Predicted depth maps [N, H, W] or [N, 1, H, W]
         t0_2_tn: Ego-to-ego transforms [B, (T-1)*N, 4, 4]
         render_gt: Ground truth images [B, T*N, H, W, 3]
         backproject_depth: BackprojectDepth module
@@ -141,9 +142,12 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
             gradient signal. Filtering these prevents identity loss from dominating.
         pixel_mask: Optional [N, 1, H, W] bool mask. True = valid pixel for loss.
             Used to exclude ego car, sky, and dynamic objects from warp loss.
+        return_diagnostics: If True, return (loss, diag_dict) with separate
+            identity/warp losses and warp-wins fraction for debugging.
 
     Returns:
-        Scalar warping loss, or zero tensor if all frames are stationary
+        Scalar warping loss, or zero tensor if all frames are stationary.
+        If return_diagnostics=True, returns (loss, diag_dict).
     """
     reprojection_losses = []
     identity_reprojection_losses = []
@@ -184,7 +188,11 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
 
     # All frames were stationary — return zero loss (no gradient)
     if len(reprojection_losses) == 0:
-        return torch.tensor(0.0, device=depths.device, requires_grad=True)
+        zero = torch.tensor(0.0, device=depths.device, requires_grad=True)
+        if return_diagnostics:
+            return zero, {'identity_loss': 0.0, 'warp_reproj_loss': 0.0,
+                          'warp_wins_frac': 0.0, 'skipped': True}
+        return zero
 
     reprojection_losses = torch.cat(reprojection_losses, dim=0)
     identity_reprojection_losses = torch.cat(identity_reprojection_losses, dim=0)
@@ -196,6 +204,37 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
 
     combined = torch.cat((identity_reprojection_losses, reprojection_losses), dim=1)
     to_optimise, _ = torch.min(combined, dim=1)
+
+    # Compute diagnostics before masking (for logging)
+    diag = None
+    if return_diagnostics:
+        with torch.no_grad():
+            # Apply valid_row + pixel_mask to identity and warp separately
+            ident = identity_reprojection_losses.squeeze(1)  # [P*N, H, W]
+            warp_r = reprojection_losses.squeeze(1)  # [P*N, H, W]
+            if valid_row > 0:
+                ident = ident[:, valid_row:, :]
+                warp_r = warp_r[:, valid_row:, :]
+            if pixel_mask is not None:
+                pm_d = pixel_mask[:num_cams].squeeze(1).float()
+                if valid_row > 0:
+                    pm_d = pm_d[:, valid_row:, :]
+                if ident.shape[0] > pm_d.shape[0]:
+                    pm_d = pm_d.repeat(ident.shape[0] // pm_d.shape[0], 1, 1)
+                cnt = pm_d.sum().clamp(min=1.0)
+                ident_mean = (ident * pm_d).sum() / cnt
+                warp_r_mean = (warp_r * pm_d).sum() / cnt
+                warp_wins = ((warp_r < ident) & (pm_d > 0.5)).float().sum() / cnt
+            else:
+                ident_mean = ident.mean()
+                warp_r_mean = warp_r.mean()
+                warp_wins = (warp_r < ident).float().mean()
+            diag = {
+                'identity_loss': ident_mean.item(),
+                'warp_reproj_loss': warp_r_mean.item(),
+                'warp_wins_frac': warp_wins.item(),
+                'skipped': False,
+            }
 
     # Exclude blind rows (no backbone features) from loss
     if valid_row > 0:
@@ -213,6 +252,12 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
             pm = pm.repeat(num_past, 1, 1)
         to_optimise = to_optimise * pm
         count = pm.sum().clamp(min=1.0)
-        return to_optimise.sum() / count
+        loss = to_optimise.sum() / count
+        if return_diagnostics:
+            return loss, diag
+        return loss
 
-    return to_optimise.mean()
+    loss = to_optimise.mean()
+    if return_diagnostics:
+        return loss, diag
+    return loss

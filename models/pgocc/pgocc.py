@@ -486,12 +486,40 @@ class PGOccLightning(pl.LightningModule):
             render_depths = render_depths.clamp(min=0.1, max=80.0)
 
             # Temporal depth warping loss (with smooth warmup + pixel masking)
-            loss_warp = calc_time_warping_loss(
+            do_warp_diag = (i == 0 and batch_idx % 50 == 0)
+            loss_warp_result = calc_time_warping_loss(
                 render_depths[0:self.num_cams],
                 batch['t0_2_x_geo'], batch['render_gt'],
                 self.backproject_depth, self.project_3d, K,
                 num_cams=self.num_cams, valid_row=valid_row,
-                pixel_mask=warp_pixel_mask)
+                pixel_mask=warp_pixel_mask,
+                return_diagnostics=do_warp_diag)
+            if do_warp_diag:
+                loss_warp, warp_diag = loss_warp_result
+                if not warp_diag.get('skipped', False):
+                    loss_dict['warp_identity_loss'] = warp_diag['identity_loss']
+                    loss_dict['warp_reproj_loss'] = warp_diag['warp_reproj_loss']
+                    loss_dict['warp_wins_frac'] = warp_diag['warp_wins_frac']
+                    # Control: compute warp with foundation depth
+                    with torch.no_grad():
+                        foundation_depth = batch['depth'].clone().squeeze(0).to(self.device)
+                        fd_resized = F.interpolate(
+                            foundation_depth, size=(self.render_conf['render_h'],
+                                                    self.render_conf['render_w']),
+                            mode='bilinear', align_corners=False)
+                        _, fd_diag = calc_time_warping_loss(
+                            fd_resized[0:self.num_cams],
+                            batch['t0_2_x_geo'], batch['render_gt'],
+                            self.backproject_depth, self.project_3d, K,
+                            num_cams=self.num_cams, valid_row=valid_row,
+                            pixel_mask=warp_pixel_mask,
+                            return_diagnostics=True)
+                    if not fd_diag.get('skipped', False):
+                        loss_dict['fd_warp_identity_loss'] = fd_diag['identity_loss']
+                        loss_dict['fd_warp_reproj_loss'] = fd_diag['warp_reproj_loss']
+                        loss_dict['fd_warp_wins_frac'] = fd_diag['warp_wins_frac']
+            else:
+                loss_warp = loss_warp_result
             loss_dict[f'warp_{i}'] = loss_warp.item()
             total_loss = total_loss + loss_warp * self.loss_weights['depth_warping'] * warp_factor
 
