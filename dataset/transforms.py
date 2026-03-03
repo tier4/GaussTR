@@ -1022,17 +1022,27 @@ class PackPGOccInputs:
 
         packed['img_metas'] = img_metas
 
-        # SAM3 semantic mask: [N_total, H, W] → pack current-frame only [N, 1, H, W]
+        # SAM3 semantic mask: resize to render resolution in dataloader to avoid
+        # transferring 214MB (1860×2880 int64) per sample through the pipeline.
+        # Nearest-neighbor preserves integer class labels.
         if 'sam3_mask' in results:
-            sam3 = results['sam3_mask']  # [N_total, H, W] int64
-            packed['sam3_mask'] = sam3[:num_cams].unsqueeze(1)  # [N, 1, H, W]
+            sam3 = results['sam3_mask'][:num_cams]  # [N, H, W] int64
+            sam3 = F.interpolate(
+                sam3.unsqueeze(1).float(),
+                size=(self.render_h, self.render_w),
+                mode='nearest').long()  # [N, 1, Rh, Rw]
+            packed['sam3_mask'] = sam3
 
-        # Sparse LiDAR GT depth: [N_total, H, W] → current-frame only [N, 1, H, W]
+        # Sparse LiDAR GT depth: downsample to render resolution using max-pool
+        # to preserve sparse LiDAR points (107MB → 0.2MB per sample).
+        # Max-pool selects the valid depth if any exists in each spatial block.
         if 'gt_depth' in results:
-            gt_depth = results['gt_depth']  # [N_total, H, W] float32
+            gt_depth = results['gt_depth'][:num_cams]  # [N, H, W] float32
             if gt_depth.dim() == 3:
                 gt_depth = gt_depth.unsqueeze(1)
-            packed['gt_depth'] = gt_depth[:num_cams]  # [N, 1, H, W]
+            gt_depth = F.adaptive_max_pool2d(
+                gt_depth, (self.render_h, self.render_w))  # [N, 1, Rh, Rw]
+            packed['gt_depth'] = gt_depth
 
         for key in ['token', 'scene_token', 'timestamp', 'sample_idx']:
             if key in results:

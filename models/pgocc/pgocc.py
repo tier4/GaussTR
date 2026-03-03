@@ -245,27 +245,23 @@ class PGOccLightning(pl.LightningModule):
         """Build per-loss masks from SAM3 semantic labels.
 
         Args:
-            sam3_mask: [N, 1, H_orig, W_orig] int64 SAM3 class labels
+            sam3_mask: [N, 1, Rh, Rw] int64 SAM3 class labels (pre-resized in dataloader)
 
         Returns:
             sky_mask: [N, 1, Rh, Rw] bool — True = not sky
             dynamic_mask: [N, 1, Rh, Rw] bool — True = not dynamic object
         """
-        rh, rw = self.render_conf['render_h'], self.render_conf['render_w']
-        # Resize to render resolution using nearest-neighbor
-        sam3_render = F.interpolate(
-            sam3_mask.float(), size=(rh, rw), mode='nearest').long()  # [N, 1, Rh, Rw]
-
+        # SAM3 is already at render resolution (resized in PackPGOccInputs)
         # Sky mask: True where NOT sky
-        sky_mask = torch.ones_like(sam3_render, dtype=torch.bool)
+        sky_mask = torch.ones_like(sam3_mask, dtype=torch.bool)
         for sid in self._sam3_sky_ids:
-            sky_mask &= (sam3_render != sid)
+            sky_mask &= (sam3_mask != sid)
 
         # Dynamic mask: True where NOT dynamic object
-        dynamic_mask = torch.ones_like(sam3_render, dtype=torch.bool)
-        dynamic_ids = torch.tensor(self._sam3_dynamic_ids, device=sam3_render.device)
+        dynamic_mask = torch.ones_like(sam3_mask, dtype=torch.bool)
+        dynamic_ids = torch.tensor(self._sam3_dynamic_ids, device=sam3_mask.device)
         for did in dynamic_ids:
-            dynamic_mask &= (sam3_render != did)
+            dynamic_mask &= (sam3_mask != did)
 
         return sky_mask, dynamic_mask
 
@@ -496,10 +492,12 @@ class PGOccLightning(pl.LightningModule):
                 return_diagnostics=do_warp_diag)
             if do_warp_diag:
                 loss_warp, warp_diag = loss_warp_result
+                # Always populate diagnostic keys (even for stationary samples)
+                # to ensure all DDP ranks call the same number of sync_dist allreduces.
+                loss_dict['warp_identity_loss'] = warp_diag['identity_loss']
+                loss_dict['warp_reproj_loss'] = warp_diag['warp_reproj_loss']
+                loss_dict['warp_wins_frac'] = warp_diag['warp_wins_frac']
                 if not warp_diag.get('skipped', False):
-                    loss_dict['warp_identity_loss'] = warp_diag['identity_loss']
-                    loss_dict['warp_reproj_loss'] = warp_diag['warp_reproj_loss']
-                    loss_dict['warp_wins_frac'] = warp_diag['warp_wins_frac']
                     # Control: compute warp with foundation depth
                     with torch.no_grad():
                         foundation_depth = batch['depth'].clone().squeeze(0).to(self.device)
@@ -514,10 +512,13 @@ class PGOccLightning(pl.LightningModule):
                             num_cams=self.num_cams, valid_row=valid_row,
                             pixel_mask=warp_pixel_mask,
                             return_diagnostics=True)
-                    if not fd_diag.get('skipped', False):
-                        loss_dict['fd_warp_identity_loss'] = fd_diag['identity_loss']
-                        loss_dict['fd_warp_reproj_loss'] = fd_diag['warp_reproj_loss']
-                        loss_dict['fd_warp_wins_frac'] = fd_diag['warp_wins_frac']
+                    loss_dict['fd_warp_identity_loss'] = fd_diag['identity_loss']
+                    loss_dict['fd_warp_reproj_loss'] = fd_diag['warp_reproj_loss']
+                    loss_dict['fd_warp_wins_frac'] = fd_diag['warp_wins_frac']
+                else:
+                    loss_dict['fd_warp_identity_loss'] = 0.0
+                    loss_dict['fd_warp_reproj_loss'] = 0.0
+                    loss_dict['fd_warp_wins_frac'] = 0.0
             else:
                 loss_warp = loss_warp_result
             loss_dict[f'warp_{i}'] = loss_warp.item()
@@ -566,25 +567,17 @@ class PGOccLightning(pl.LightningModule):
             loss_dict[f'depth_{i}'] = loss_depth.item()
             total_loss = total_loss + loss_depth * self.loss_weights['depth_foundation']
 
-            # Sparse LiDAR GT depth loss
+            # Sparse LiDAR GT depth loss (GT pre-downsampled to render resolution)
             if 'gt_depth' in batch and 'depth_gt' in self.loss_weights:
-                gt_depth = batch['gt_depth'].squeeze(0).to(self.device)  # [N, 1, H, W]
+                gt_depth = batch['gt_depth'].squeeze(0).to(self.device)  # [N, 1, Rh, Rw]
                 gt_mask = (gt_depth > 0.1) & (gt_depth < 80.0)
-                # Mask blind region (no backbone features → garbage rendered depth)
+                # Mask blind region
                 if valid_row > 0:
-                    gt_h = gt_depth.shape[-2]
-                    valid_row_orig = int(valid_row / self.render_conf['render_h'] * gt_h)
-                    gt_mask[:, :, :valid_row_orig, :] = False
-                # Apply ego + sky mask at original resolution
-                if sam3_mask is not None:
-                    gt_sky_mask = torch.ones_like(sam3_mask, dtype=torch.bool)
-                    for sid in self._sam3_sky_ids:
-                        gt_sky_mask &= (sam3_mask != sid)
-                    gt_mask = gt_mask & gt_sky_mask
-                # Ego mask at original resolution
-                ego_orig = F.interpolate(
-                    ego_mask.float(), size=gt_depth.shape[-2:], mode='nearest').bool()
-                gt_mask = gt_mask & ego_orig
+                    gt_mask[:, :, :valid_row, :] = False
+                # Apply sky + ego masks (already at render resolution)
+                if sky_mask is not None:
+                    gt_mask = gt_mask & sky_mask
+                gt_mask = gt_mask & ego_mask
                 gt_mask.detach_()
                 loss_gt = get_gt_loss(render_depths, gt_depth, gt_mask)
                 loss_dict[f'depth_gt_{i}'] = loss_gt.item()
