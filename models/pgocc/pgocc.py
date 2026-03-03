@@ -55,7 +55,7 @@ class PGOccLightning(pl.LightningModule):
         ov_dim: int = 768,
         # Losses
         loss_weights: dict = None,
-        warp_warmup_epochs: int = 2,
+        warp_warmup_epochs: float = 2,
         # Masking
         ego_car_mask_dir: str = "",
         ego_car_mask_map: dict = None,

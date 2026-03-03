@@ -54,8 +54,8 @@ model:
     ov_mse: 10.0
     ov_cos: 1.0
     depth_foundation: 1.0  # Increased: SAM3 sky masking now prevents garbage gradients
-    depth_gt: 0.5          # Increased: SAM3+ego masking filters invalid GT depth pixels
-  warp_warmup_epochs: 2    # Moderate warmup — warp works when it fires (59% wins masked)
+    depth_gt: 0.05         # Light regularizer — sparse LiDAR (0.5% pixels), SiLog dominates if higher
+  warp_warmup_epochs: 0.25  # ¼ epoch ≈ 5.5k steps (original PG-Occ used ~3.5k on nuScenes)
 
   # Masking — ego car bonnet + SAM3 semantic classes
   ego_car_mask_dir: "assets/ego_car_masks"
