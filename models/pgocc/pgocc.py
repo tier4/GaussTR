@@ -140,6 +140,23 @@ class PGOccLightning(pl.LightningModule):
         self.register_buffer('img_mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('img_std', torch.tensor(std).view(1, 3, 1, 1))
 
+        # === EMA PCA for stable dimensionality reduction (ported from GaussTR) ===
+        reduce_dims = 128
+        self.reduce_dims = reduce_dims
+        self.pca_ema_momentum = 0.1
+        self.register_buffer('pca_v', torch.zeros(ov_dim, reduce_dims))
+        self.register_buffer('pca_initialized', torch.tensor(0, dtype=torch.long))
+
+        # === Classification head MLP (ported from GaussTR) ===
+        # Learnable MLP absorbs classification gradient, preventing sem_ce from
+        # pulling OV features away from DINOv3CLIP targets.
+        # Input: PCA-reduced rendered features (128-dim) → 16 SAM3 classes
+        self.class_head = nn.Sequential(
+            nn.Linear(reduce_dims, reduce_dims * 4),
+            nn.ReLU(),
+            nn.Linear(reduce_dims * 4, 16),
+        )
+
         # === Ego car masks ===
         # Pre-computed binary masks for cameras where the ego car bonnet is visible.
         # Loaded once at init, resized to render resolution, registered as buffers.
@@ -192,6 +209,17 @@ class PGOccLightning(pl.LightningModule):
             self.register_buffer('text_proto_embeds', embeds)
         else:
             self.register_buffer('text_proto_embeds', None)
+
+        # === SAM3-aligned text embeddings for semantic contrastive loss ===
+        if text_protos_sam3 and os.path.exists(text_protos_sam3):
+            sam3_embeds = torch.load(text_protos_sam3, map_location='cpu')
+            # Ensure shape is [embed_dim, num_classes]
+            if sam3_embeds.shape[0] < sam3_embeds.shape[1]:
+                sam3_embeds = sam3_embeds.T
+            self.register_buffer('text_proto_embeds_sam3', sam3_embeds)
+        else:
+            self.register_buffer('text_proto_embeds_sam3', None)
+        self.text_loss_temp = text_loss_temp
 
         # === Voxelizer for evaluation ===
         self.voxelizer = None
@@ -266,6 +294,42 @@ class PGOccLightning(pl.LightningModule):
             dynamic_mask &= (sam3_mask != did)
 
         return sky_mask, dynamic_mask
+
+    def _text_contrastive_loss(self, pred_feats, sam3_labels, text_embeds, valid_row=0):
+        """Text contrastive loss: cosine similarity to SAM3-aligned text prototypes.
+
+        Adapted from GaussTR's text_contrastive_loss (gausstr_head.py:544-591).
+
+        Args:
+            pred_feats: [N, C, H, W] features in full OV space (reconstructed from PCA)
+            sam3_labels: [N, H, W] SAM3 class labels (0-17)
+            text_embeds: [C, 17] SAM3-aligned text prototype embeddings
+            valid_row: Number of top rows to exclude (blind region)
+
+        Returns:
+            Scalar contrastive loss
+        """
+        N, C, H, W = pred_feats.shape
+
+        pred_norm = F.normalize(pred_feats, dim=1, eps=1e-6)
+        text_norm = F.normalize(text_embeds, dim=0, eps=1e-6)
+
+        # Cosine similarity: [N, C, H, W] @ [C, 17] -> [N, 17, H, W]
+        logits = torch.einsum('nchw,ck->nkhw', pred_norm, text_norm) / self.text_loss_temp
+
+        # Valid mask: exclude background (0), other_flat (12), sky (17)
+        valid_mask = (sam3_labels >= 1) & (sam3_labels <= 16) & (sam3_labels != 12)
+        if valid_row > 0:
+            valid_mask[:, :valid_row, :] = False
+        # Apply ego mask
+        valid_mask = valid_mask & self.ego_car_mask.squeeze(1).to(valid_mask.device)
+
+        # Shift labels: SAM3 1-17 -> 0-16
+        targets = (sam3_labels - 1).clamp(min=0)
+
+        ce_loss = F.cross_entropy(logits, targets.long(), reduction='none')
+        num_valid = valid_mask.float().sum().clamp(min=1)
+        return (ce_loss * valid_mask.float()).sum() / num_valid
 
     def _build_backbone(self, frozen_stages, pretrained_path):
         """Build ResNet50 backbone with optional COCO pretrained weights."""
@@ -413,13 +477,30 @@ class PGOccLightning(pl.LightningModule):
         # Prepare camera attributes for rendering
         K, C2W, W2C = prepare_gs_attribute(img_metas, num_cams=self.num_cams)
 
-        # Per-batch PCA reduction of OV target features (fixv23 behavior)
+        # EMA PCA reduction of OV target features (ported from GaussTR)
         ov_tgt_feature = batch['text_vision'].clone().detach().permute(0, 1, 3, 4, 2)
         ov_tgt_feature_pca = ov_tgt_feature.flatten(2, 3)
 
-        pca_u, pca_s, pca_v = torch.pca_lowrank(
-            ov_tgt_feature_pca.flatten(0, 2).double(), q=128, niter=4)
+        with torch.amp.autocast('cuda', enabled=False):
+            _, _, pca_v_batch = torch.pca_lowrank(
+                ov_tgt_feature_pca.flatten(0, 2).double(), q=self.reduce_dims, niter=4)
 
+            if self.pca_initialized.item() == 0:
+                self.pca_v.copy_(pca_v_batch.float())
+                self.pca_initialized.fill_(1)
+            else:
+                # Align signs to handle PCA sign ambiguity
+                sign = torch.sign((self.pca_v.double() * pca_v_batch).sum(dim=0, keepdim=True))
+                sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                v_aligned = (pca_v_batch * sign).float()
+                self.pca_v.mul_(1 - self.pca_ema_momentum).add_(
+                    v_aligned * self.pca_ema_momentum)
+
+            # Sync across GPUs in DDP
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(self.pca_v, op=torch.distributed.ReduceOp.AVG)
+
+        pca_v = self.pca_v  # [ov_dim, reduce_dims], stable EMA projection
         ov_tgt_feature = ov_tgt_feature @ pca_v.to(ov_tgt_feature)
 
         # Interpolate OV target to render resolution
@@ -486,7 +567,11 @@ class PGOccLightning(pl.LightningModule):
             render_depth_ed = render_results['depth'].permute(0, 3, 1, 2)
             render_alphas = render_results['alphas'].permute(0, 3, 1, 2)  # [N, 1, H, W]
 
+            # ED (true depth) for warp loss
             render_depth_ed = render_depth_ed.clamp(min=0.1, max=80.0)
+
+            # Accumulated depth for depth supervision (coverage incentive)
+            render_depth_acc = (render_depth_ed * render_alphas).clamp(min=0.01, max=80.0)
 
             alpha_mask = (render_alphas > 0.1).detach()
 
@@ -567,6 +652,48 @@ class PGOccLightning(pl.LightningModule):
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
                 total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos']
 
+            # SAM3 semantic classification loss via class_head MLP (ported from GaussTR)
+            # The MLP absorbs classification gradient — features stay aligned with DINOv3CLIP.
+            if (sam3_mask is not None and gaussian.ovs is not None
+                    and 'sem_ce' in self.loss_weights):
+                # ov_feature: [1, N, Rh, Rw, D_pca] — rendered PCA-projected features
+                ov_rendered = ov_feature.squeeze(0)  # [N, Rh, Rw, D_pca]
+                # class_head MLP: [N, Rh, Rw, D_pca] → [N, Rh, Rw, 16] → [N, 16, Rh, Rw]
+                class_logits = self.class_head(ov_rendered).permute(0, 3, 1, 2)
+
+                # SAM3 labels: values 0-17 (0=bg, 16=sky, 17=sky variant)
+                sam3_labels = sam3_mask.squeeze(1)  # [N, Rh, Rw]
+                targets = (sam3_labels - 1).clamp(min=0)  # shift 1-16 to 0-15
+
+                # Valid: exclude background (0), sky (>=16)
+                valid = (sam3_labels >= 1) & (sam3_labels <= 15)
+                if valid_row > 0:
+                    valid[:, :valid_row, :] = False
+                valid = valid & ego_mask.squeeze(1)
+                targets = torch.where(valid, targets, torch.zeros_like(targets))
+
+                if valid.sum() > 0:
+                    ce = F.cross_entropy(class_logits, targets.long(), reduction='none')
+                    loss_sem_ce = (ce * valid.float()).sum() / valid.float().sum()
+                    loss_dict[f'sem_ce_{i}'] = loss_sem_ce.item()
+                    total_loss = total_loss + loss_sem_ce * self.loss_weights['sem_ce']
+
+            # Text contrastive loss (gentle text-prototype alignment alongside MLP-based sem_ce)
+            if (sam3_mask is not None and gaussian.ovs is not None
+                    and 'sem_text' in self.loss_weights
+                    and self.text_proto_embeds_sam3 is not None):
+                ov_rendered = ov_feature.squeeze(0)  # [N, Rh, Rw, D_pca]
+                # Project PCA features to full OV space for text similarity
+                # pca_v: [ov_dim, reduce_dims] → transpose to [reduce_dims, ov_dim]
+                ov_full = ov_rendered @ pca_v.to(ov_rendered).T  # [N, Rh, Rw, ov_dim]
+                ov_full = ov_full.permute(0, 3, 1, 2)  # [N, ov_dim, Rh, Rw]
+
+                sam3_labels = sam3_mask.squeeze(1)  # [N, Rh, Rw]
+                loss_text = self._text_contrastive_loss(
+                    ov_full, sam3_labels, self.text_proto_embeds_sam3, valid_row)
+                loss_dict[f'sem_text_{i}'] = loss_text.item()
+                total_loss = total_loss + loss_text * self.loss_weights['sem_text']
+
             # Foundation depth loss (masked: ego car + sky + valid_row)
             depth_tgt = batch['depth'].clone().squeeze(0)  # [N, 1, Hd, Wd]
             mask = (depth_tgt > 0.1) & (depth_tgt < 51.2)
@@ -594,6 +721,49 @@ class PGOccLightning(pl.LightningModule):
                 loss_gt = get_gt_loss(render_depth_ed, gt_depth, gt_mask)
                 loss_dict[f'depth_gt_{i}'] = loss_gt.item()
                 total_loss = total_loss + loss_gt * self.loss_weights['depth_gt']
+
+        # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
+        # Encourage Gaussians to cover dynamic object regions instead of ignoring them.
+        if (sam3_mask is not None
+                and 'dyn_cov' in self.loss_weights
+                and gau_preds):
+            # dynamic_mask is True=NOT dynamic; invert for IS dynamic
+            dyn_pixel_mask = ~dynamic_mask & ego_mask  # [N, 1, Rh, Rw]
+            if valid_row > 0:
+                dyn_pixel_mask[:, :, :valid_row, :] = False
+            # Exclude sky from dynamic mask (safety)
+            if sky_mask is not None:
+                dyn_pixel_mask = dyn_pixel_mask & sky_mask
+
+            dyn_count = dyn_pixel_mask.sum().clamp(min=1.0)
+
+            # Use renders from finest Gaussian level (last in loop)
+            # render_alphas / render_depth_ed are already from the last iteration
+
+            # L_dyn_cov: BCE encouraging alpha→1 on dynamic pixels
+            # Use logit-space BCE (autocast-safe under bf16-mixed)
+            dyn_alpha = render_alphas[dyn_pixel_mask].float().clamp(1e-6, 1 - 1e-6)
+            dyn_logits = torch.logit(dyn_alpha)
+            loss_dyn_cov = F.binary_cross_entropy_with_logits(
+                dyn_logits, torch.ones_like(dyn_logits))
+            loss_dict['dyn_cov'] = loss_dyn_cov.item()
+            total_loss = total_loss + loss_dyn_cov * self.loss_weights['dyn_cov']
+
+            # L_dyn_depth: L1 on dynamic pixels where foundation depth is valid
+            if 'dyn_depth' in self.loss_weights:
+                dyn_depth_mask = dyn_pixel_mask & (depth_tgt > 0.1) & (depth_tgt < 51.2)
+                if dyn_depth_mask.sum() > 10:
+                    loss_dyn_depth = F.l1_loss(
+                        render_depth_ed[dyn_depth_mask],
+                        depth_tgt[dyn_depth_mask])
+                    loss_dict['dyn_depth'] = loss_dyn_depth.item()
+                    total_loss = total_loss + loss_dyn_depth * self.loss_weights['dyn_depth']
+
+            # Log dynamic coverage stats periodically
+            if batch_idx % 100 == 0:
+                dyn_alpha_mean = render_alphas[dyn_pixel_mask].mean().item() if dyn_pixel_mask.sum() > 0 else 0.0
+                self.log('train/dyn_alpha_coverage', dyn_alpha_mean, sync_dist=True)
+                self.log('train/dyn_pixel_ratio', dyn_pixel_mask.float().mean().item(), sync_dist=True)
 
         # Log losses
         self.log('train_loss', total_loss, prog_bar=True, sync_dist=True)

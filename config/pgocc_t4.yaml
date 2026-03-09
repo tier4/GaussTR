@@ -55,7 +55,8 @@ model:
     ov_cos: 1.0
     depth_foundation: 1.0
     depth_gt: 0.05         # Reverted to fixv23 — sparse LiDAR as gentle regularizer
-    # sem_ce and sem_text removed — gradient conflict with ov_mse/ov_cos
+    sem_ce: 1.0            # MLP-based class head (absorbs classification gradient)
+    sem_text: 0.5          # Text contrastive loss (gentle text-prototype alignment)
   warp_warmup_epochs: 0.25  # ¼ epoch ≈ 5.5k steps (original PG-Occ used ~3.5k on nuScenes)
 
   # Masking — ego car bonnet + SAM3 semantic classes
