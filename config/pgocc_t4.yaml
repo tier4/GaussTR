@@ -50,11 +50,13 @@ model:
 
   # Losses
   loss_weights:
-    depth_warping: 5.0     # Halved: warp only fires on ~45% of T4 samples (55% stationary)
+    depth_warping: 5.0     # Reverted to fixv23 — warp is primary self-supervised signal
     ov_mse: 10.0
     ov_cos: 1.0
-    depth_foundation: 1.0  # Increased: SAM3 sky masking now prevents garbage gradients
-    depth_gt: 0.05         # Light regularizer — sparse LiDAR (0.5% pixels), SiLog dominates if higher
+    depth_foundation: 1.0
+    depth_gt: 0.05         # Reverted to fixv23 — sparse LiDAR as gentle regularizer
+    sem_ce: 1.0            # MLP-based class head (absorbs classification gradient)
+    sem_text: 0.5          # Text contrastive loss (gentle text-prototype alignment)
   warp_warmup_epochs: 0.25  # ¼ epoch ≈ 5.5k steps (original PG-Occ used ~3.5k on nuScenes)
 
   # Masking — ego car bonnet + SAM3 semantic classes
@@ -66,13 +68,15 @@ model:
   sam3_class_config: "assets/sam3_class_config.json"
 
   # Evaluation
-  density_threshold: 0.04
+  density_threshold: 0.01    # Lowered from 0.04 — +66% voxel coverage
   text_protos: "ckpts/text_proto_embeds_dinov3clip.pth"
+  text_protos_sam3: "ckpts/text_proto_embeds_dinov3clip_sam3.pth"
+  text_loss_temp: 0.07
 
   # Voxelizer (reuse GaussTR's CUDA voxelizer)
   vol_range: [-40.4, -40.4, -1.4, 39.6, 39.6, 5.0]
   filter_gaussians: true
-  opacity_thresh: 0.6
+  opacity_thresh: 0.3     # Lowered from 0.6 — includes more Gaussians in voxelization
   sigma_factor: 3.0
 
   # Optimizer

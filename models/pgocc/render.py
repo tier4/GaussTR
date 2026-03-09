@@ -109,10 +109,13 @@ class SiLogLoss(nn.Module):
 
 
 def get_depth_loss(depth_render, depth, mask):
-    """Foundation depth loss: SiLog 15% + L1 85%.
+    """Foundation depth loss: 0.15*SiLog + 0.85*L1 (L1-dominant for fast convergence).
+
+    Uses L1-dominant weighting because depth_render is true expected depth (ED).
+    L1 catches large errors quickly while SiLog provides scale-invariant gradients.
 
     Args:
-        depth_render: Rendered depth from Gaussians
+        depth_render: True expected depth (ED) from Gaussians
         depth: Foundation model depth (PriorDA)
         mask: Valid depth mask
 

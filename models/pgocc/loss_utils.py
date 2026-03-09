@@ -151,6 +151,7 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
     """
     reprojection_losses = []
     identity_reprojection_losses = []
+    oob_fractions = []
 
     render_gt = render_gt[0].permute(0, 3, 1, 2) / 255.0
     t0_img = render_gt[0:num_cams]
@@ -180,6 +181,15 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
             align_corners=True)
 
         reprojection_loss = compute_reprojection_loss(warped_img, t0_img)
+
+        # Force identity to win on out-of-bounds projections.  Back cameras
+        # have 40-67% OOB pixels; border padding creates artifacts that inject
+        # noise into the warp gradient.  Setting loss to 1.0 (max possible)
+        # ensures identity always wins → zero depth gradient on these pixels.
+        oob = (pix_coords[..., 0].abs() > 1.0) | (pix_coords[..., 1].abs() > 1.0)
+        reprojection_loss = reprojection_loss.masked_fill(oob.unsqueeze(1), 1.0)
+        oob_fractions.append(oob.float().mean().item())
+
         reprojection_losses.append(reprojection_loss)
 
         identity_reprojection_loss = compute_reprojection_loss(
@@ -203,7 +213,9 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
         device=identity_reprojection_losses.device) * 0.00001
 
     combined = torch.cat((identity_reprojection_losses, reprojection_losses), dim=1)
-    to_optimise, _ = torch.min(combined, dim=1)
+    to_optimise, min_idxs = torch.min(combined, dim=1)
+    # min_idxs: 0 = identity won, 1 = warp won (reprojection was lower)
+    warp_wins_mask = (min_idxs == 1).float()  # [P*N, H, W]
 
     # Compute diagnostics before masking (for logging)
     diag = None
@@ -233,26 +245,30 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
                 'identity_loss': ident_mean.item(),
                 'warp_reproj_loss': warp_r_mean.item(),
                 'warp_wins_frac': warp_wins.item(),
+                'oob_frac': sum(oob_fractions) / max(len(oob_fractions), 1),
                 'skipped': False,
             }
 
     # Exclude blind rows (no backbone features) from loss
     if valid_row > 0:
         to_optimise = to_optimise[:, valid_row:, :]
+        warp_wins_mask = warp_wins_mask[:, valid_row:, :]
 
-    # Apply per-pixel mask (ego car, sky, dynamic objects)
+    # Standard auto-masking: mean over ALL valid pixels.
+    # Identity-winning pixels have zero depth gradient (identity doesn't depend
+    # on rendered depth), so they naturally contribute zero gradient while the
+    # fixed denominator (N_total) provides stable gradient magnitude across
+    # samples.  Using warp-winning-only (N_warp denominator) amplifies gradient
+    # variance because N_warp fluctuates 3x between samples (12-41%).
     if pixel_mask is not None:
-        # pixel_mask is [N, 1, H, W] — squeeze to [N, H, W] to match to_optimise [P*N, H, W]
         pm = pixel_mask[:num_cams].squeeze(1).float()
         if valid_row > 0:
             pm = pm[:, valid_row:, :]
-        # to_optimise is [P*N, H', W'] when multiple past frames
         if to_optimise.shape[0] > pm.shape[0]:
             num_past = to_optimise.shape[0] // pm.shape[0]
             pm = pm.repeat(num_past, 1, 1)
-        to_optimise = to_optimise * pm
         count = pm.sum().clamp(min=1.0)
-        loss = to_optimise.sum() / count
+        loss = (to_optimise * pm).sum() / count
         if return_diagnostics:
             return loss, diag
         return loss
