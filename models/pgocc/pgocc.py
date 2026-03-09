@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torchvision.models import resnet50
 
 from .fpn import FPN
+from .gaussian_prediction import GaussianPrediction
 from .sparse_gaussians_decoder import SparseGaussiansDecoder
 from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss, get_gt_loss
 from .loss_utils import BackprojectDepth, Project3D, calc_time_warping_loss
@@ -558,29 +559,59 @@ class PGOccLightning(pl.LightningModule):
             if gaussian.ovs is not None:
                 gaussian.ovs = gaussian.ovs @ pca_v.to(gaussian.ovs)
 
-            # Render depth + OV features from Gaussians
+            # Render depth + OV features from Gaussians (blended — all Gaussians)
             render_results = batch_splatting_render(
                 gaussian, W2C, K, render_conf=self.render_conf)
 
-            # gsplat "RGB+ED" returns expected depth = sum(w_i*z_i)/sum(w_i),
-            # i.e. alpha-normalized (true depth). Used for both warp and depth losses.
             render_depth_ed = render_results['depth'].permute(0, 3, 1, 2)
             render_alphas = render_results['alphas'].permute(0, 3, 1, 2)  # [N, 1, H, W]
-
-            # ED (true depth) for warp loss
             render_depth_ed = render_depth_ed.clamp(min=0.1, max=80.0)
-
-            # Accumulated depth for depth supervision (coverage incentive)
-            render_depth_acc = (render_depth_ed * render_alphas).clamp(min=0.01, max=80.0)
-
             alpha_mask = (render_alphas > 0.1).detach()
 
-            # Temporal depth warping loss (with smooth warmup + pixel masking)
-            # Combine warp_pixel_mask (ego+sky+dynamic) with alpha_mask
-            warp_full_mask = warp_pixel_mask & alpha_mask
+            # === Phase 2: Branch-aware static/dynamic rendering ===
+            if gaussian.branch_probs is not None and sam3_mask is not None:
+                p_static = gaussian.branch_probs[..., 0]   # [B, Q]
+                p_dynamic = gaussian.branch_probs[..., 1]   # [B, Q]
+
+                # Static layer: opacity * p_static — for warp loss
+                gaussian_static = GaussianPrediction(
+                    means=gaussian.means, scales=gaussian.scales,
+                    rotations=gaussian.rotations,
+                    opacities=gaussian.opacities * p_static,
+                    ovs=None, colors=None,
+                )
+                static_results = batch_splatting_render(
+                    gaussian_static, W2C, K, render_conf=self.render_conf,
+                    inference=True)
+                static_depth = static_results['depth'].permute(0, 3, 1, 2).clamp(0.1, 80.0)
+                static_alpha = static_results['alphas'].permute(0, 3, 1, 2)
+
+                # Dynamic layer: opacity * p_dynamic — for branch supervision
+                gaussian_dynamic = GaussianPrediction(
+                    means=gaussian.means, scales=gaussian.scales,
+                    rotations=gaussian.rotations,
+                    opacities=gaussian.opacities * p_dynamic,
+                    ovs=None, colors=None,
+                )
+                dynamic_results = batch_splatting_render(
+                    gaussian_dynamic, W2C, K, render_conf=self.render_conf,
+                    inference=True)
+                dynamic_alpha = dynamic_results['alphas'].permute(0, 3, 1, 2)
+
+                # Warp uses STATIC depth (dynamic objects excluded at render level)
+                warp_depth = static_depth
+                warp_alpha_mask = (static_alpha > 0.1).detach()
+            else:
+                warp_depth = render_depth_ed
+                warp_alpha_mask = alpha_mask
+                static_alpha = None
+                dynamic_alpha = None
+
+            # Temporal depth warping loss (on STATIC depth only)
+            warp_full_mask = warp_pixel_mask & warp_alpha_mask
             do_warp_diag = (i == 0 and batch_idx % 50 == 0)
             loss_warp_result = calc_time_warping_loss(
-                render_depth_ed[0:self.num_cams],
+                warp_depth[0:self.num_cams],
                 batch['t0_2_x_geo'], batch['render_gt'],
                 self.backproject_depth, self.project_3d, K,
                 num_cams=self.num_cams, valid_row=valid_row,
@@ -721,6 +752,62 @@ class PGOccLightning(pl.LightningModule):
                 loss_gt = get_gt_loss(render_depth_ed, gt_depth, gt_mask)
                 loss_dict[f'depth_gt_{i}'] = loss_gt.item()
                 total_loss = total_loss + loss_gt * self.loss_weights['depth_gt']
+
+        # === Phase 2: Branch supervision losses (SelfOccFlow-inspired) ===
+        # Encourage static alpha to cover static pixels, dynamic alpha to cover dynamic pixels.
+        if (sam3_mask is not None
+                and static_alpha is not None
+                and dynamic_alpha is not None
+                and 'branch_static' in self.loss_weights):
+            # Build branch supervision mask: ego + valid_row + sky
+            branch_valid = ego_mask.clone()
+            if valid_row > 0:
+                branch_valid[:, :, :valid_row, :] = False
+            if sky_mask is not None:
+                branch_valid = branch_valid & sky_mask
+
+            # static_mask_pixels: True where SAM3 says static (dynamic_mask = True = NOT dynamic)
+            static_pixels = dynamic_mask & branch_valid  # [N, 1, Rh, Rw]
+            # dynamic_mask_pixels: True where SAM3 says dynamic
+            dynamic_pixels = ~dynamic_mask & branch_valid  # [N, 1, Rh, Rw]
+
+            # L_branch_static: BCE(alpha_static, 1) on static pixels
+            if static_pixels.sum() > 10:
+                sa = static_alpha[static_pixels].float().clamp(1e-6, 1 - 1e-6)
+                loss_branch_s = F.binary_cross_entropy_with_logits(
+                    torch.logit(sa), torch.ones_like(sa))
+                loss_dict['branch_static'] = loss_branch_s.item()
+                total_loss = total_loss + loss_branch_s * self.loss_weights['branch_static']
+
+            # L_branch_dynamic: BCE(alpha_dynamic, 1) on dynamic pixels
+            if dynamic_pixels.sum() > 10 and 'branch_dynamic' in self.loss_weights:
+                da = dynamic_alpha[dynamic_pixels].float().clamp(1e-6, 1 - 1e-6)
+                loss_branch_d = F.binary_cross_entropy_with_logits(
+                    torch.logit(da), torch.ones_like(da))
+                loss_dict['branch_dynamic'] = loss_branch_d.item()
+                total_loss = total_loss + loss_branch_d * self.loss_weights['branch_dynamic']
+
+            # L_branch_sep: penalize leakage (static alpha on dynamic, dynamic alpha on static)
+            if 'branch_sep' in self.loss_weights:
+                leak_s2d = (static_alpha[dynamic_pixels]).mean() if dynamic_pixels.sum() > 0 else torch.tensor(0.0)
+                leak_d2s = (dynamic_alpha[static_pixels]).mean() if static_pixels.sum() > 0 else torch.tensor(0.0)
+                loss_sep = leak_s2d + leak_d2s
+                loss_dict['branch_sep'] = loss_sep.item()
+                total_loss = total_loss + loss_sep * self.loss_weights['branch_sep']
+
+            # Log branch stats periodically
+            if batch_idx % 100 == 0:
+                self.log('train/static_alpha_on_static',
+                         static_alpha[static_pixels].mean().item() if static_pixels.sum() > 0 else 0.0,
+                         sync_dist=True)
+                self.log('train/dynamic_alpha_on_dynamic',
+                         dynamic_alpha[dynamic_pixels].mean().item() if dynamic_pixels.sum() > 0 else 0.0,
+                         sync_dist=True)
+                # Log branch probability distribution
+                if gau_preds and gau_preds[-1].branch_probs is not None:
+                    bp = gau_preds[-1].branch_probs
+                    self.log('train/p_static_mean', bp[..., 0].mean().item(), sync_dist=True)
+                    self.log('train/p_dynamic_mean', bp[..., 1].mean().item(), sync_dist=True)
 
         # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
         # Encourage Gaussians to cover dynamic object regions instead of ignoring them.

@@ -113,6 +113,17 @@ class SparseGaussiansDecoder(nn.Module):
                     ),
                 ]))
 
+        # Phase 2: static/dynamic branch head (SelfOccFlow-inspired)
+        # Predicts per-Gaussian routing: p_static + p_dynamic = 1
+        self.branch_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dims, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 2),
+            )
+            for _ in range(len(self.layers_scales))
+        ])
+
     @torch.no_grad()
     def init_weights(self):
         for layer in self.decoder_layers:
@@ -348,6 +359,10 @@ class SparseGaussiansDecoder(nn.Module):
             else:
                 ov_query_feat = None
 
+            # Phase 2: predict static/dynamic branch routing
+            b_logits = self.branch_heads[i](query_feat_part)  # [B, Q, 2]
+            b_probs = torch.softmax(b_logits, dim=-1)  # [B, Q, 2]
+
             pred_gaussians = GaussianPrediction(
                 means=query_coord,
                 scales=merged_scales,
@@ -355,6 +370,8 @@ class SparseGaussiansDecoder(nn.Module):
                 opacities=merged_opacities,
                 ovs=ov_query_feat,
                 colors=None,
+                branch_logits=b_logits,
+                branch_probs=b_probs,
             )
             gau_preds.append(pred_gaussians)
 
