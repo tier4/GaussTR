@@ -57,10 +57,8 @@ model:
     depth_gt: 0.05         # Reverted to fixv23 — sparse LiDAR as gentle regularizer
     sem_ce: 1.0            # MLP-based class head (absorbs classification gradient)
     sem_text: 0.5          # Text contrastive loss (gentle text-prototype alignment)
-    # Phase 2: static/dynamic branch supervision (SelfOccFlow-inspired)
-    branch_static: 1.0     # BCE: static alpha should cover static pixels
-    branch_dynamic: 2.0    # BCE: dynamic alpha should cover dynamic pixels (higher weight — sparse)
-    branch_sep: 0.5        # Penalize alpha leakage between branches
+    # Phase 2: per-Gaussian static/dynamic classification (SelfOccFlow-inspired)
+    branch_cls: 0.5        # BCE on branch_head logits vs SAM3 projected labels (no render)
   warp_warmup_epochs: 0.25  # ¼ epoch ≈ 5.5k steps (original PG-Occ used ~3.5k on nuScenes)
 
   # Masking — ego car bonnet + SAM3 semantic classes

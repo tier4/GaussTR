@@ -360,7 +360,8 @@ class SparseGaussiansDecoder(nn.Module):
                 ov_query_feat = None
 
             # Phase 2: predict static/dynamic branch routing
-            b_logits = self.branch_heads[i](query_feat_part)  # [B, Q, 2]
+            # Detach features — branch classification must NOT corrupt shared features
+            b_logits = self.branch_heads[i](query_feat_part.detach())  # [B, Q, 2]
             b_probs = torch.softmax(b_logits, dim=-1)  # [B, Q, 2]
 
             pred_gaussians = GaussianPrediction(
