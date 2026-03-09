@@ -846,6 +846,15 @@ class PGOccLightning(pl.LightningModule):
             warp_coverage = warp_pixel_mask.float().mean().item()
             self.log('train/warp_mask_coverage', warp_coverage, sync_dist=True)
 
+            # Temporal gate diagnostics: how much does frame 0 (current) dominate?
+            last_layer = self.decoder.decoder_layers[-1]
+            if hasattr(last_layer, '_last_gate'):
+                gate = last_layer._last_gate  # [B, Q, T], scaled by T
+                # gate=1.0 per frame means uniform; gate[0]>1 means current frame dominates
+                self.log('train/tgate_frame0_mean', gate[:, :, 0].mean().item(), sync_dist=True)
+                gate_entropy = -(gate / gate.shape[-1] * (gate / gate.shape[-1] + 1e-8).log()).sum(-1).mean()
+                self.log('train/tgate_entropy', gate_entropy.item(), sync_dist=True)
+
         return total_loss
 
     def validation_step(self, batch, batch_idx):

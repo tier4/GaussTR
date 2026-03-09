@@ -420,6 +420,9 @@ class SparseGaussiansDecoderLayer(nn.Module):
         else:
             self.self_attn = None
 
+        self.num_frames = num_frames
+        self.num_points = num_points
+
         self.sampling = SparseBEVSampling(
             embed_dims=embed_dims,
             num_frames=num_frames,
@@ -429,6 +432,16 @@ class SparseGaussiansDecoderLayer(nn.Module):
             num_cams=num_cams,
             pc_range=pc_range,
             use_anisotropy_encoding=use_anisotropy_encoding,
+        )
+
+        # Temporal attention gate (SelfOccFlow-inspired): per-query weighting
+        # of T temporal frames. Lets dynamic queries suppress noisy past-frame
+        # features while static queries keep uniform temporal aggregation.
+        # Zero-init → softmax(zeros) = 1/T → uniform → identity at init.
+        self.temporal_gate = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims // 4, num_frames),
         )
 
         self.mixing = AdaptiveMixing(
@@ -450,13 +463,32 @@ class SparseGaussiansDecoderLayer(nn.Module):
         self.sampling.init_weights()
         self.mixing.init_weights()
         self.ffn.init_weights()
+        # Zero-init temporal gate → uniform weights at start (no behavior change)
+        nn.init.zeros_(self.temporal_gate[-1].weight)
+        nn.init.zeros_(self.temporal_gate[-1].bias)
 
     def forward(self, query_feat, query_3dgs, mlvl_feats, anisotropy_info, img_metas):
         query_pos = self.position_encoder(query_3dgs[..., :3])
         query_feat = query_feat + query_pos
         if self.self_attn is not None:
             query_feat = self.norm1(self.self_attn(query_3dgs, query_feat))
+
         sampled_feat = self.sampling(query_3dgs, query_feat, mlvl_feats, anisotropy_info, img_metas)
+        # sampled_feat: [B, Q, G, T*P, C]
+
+        # Temporal attention gate: weight each frame's features per query.
+        # Static queries → uniform (all frames useful).
+        # Dynamic queries → concentrate on current frame (past frames = noise).
+        B, Q, G, TP, C = sampled_feat.shape
+        T, P = self.num_frames, self.num_points
+        gate_logits = self.temporal_gate(query_feat)  # [B, Q, T]
+        gate = F.softmax(gate_logits, dim=-1) * T  # uniform gate = 1.0 per frame
+        self._last_gate = gate.detach()  # store for diagnostics
+
+        sampled_feat = sampled_feat.view(B, Q, G, T, P, C)
+        sampled_feat = sampled_feat * gate[:, :, None, :, None, None]
+        sampled_feat = sampled_feat.reshape(B, Q, G, TP, C)
+
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
         return query_feat
