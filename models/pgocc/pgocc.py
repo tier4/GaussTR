@@ -715,71 +715,58 @@ class PGOccLightning(pl.LightningModule):
                 total_loss = total_loss + loss_gt * self.loss_weights['depth_gt']
 
         # === Phase 2: Branch classification loss (projection-based, no extra renders) ===
-        # Project Gaussian means to image space, sample SAM3 mask, supervise branch_head directly.
-        # This avoids render-level gradient conflicts with geometry.
+        # Project Gaussian means to image space, sample SAM3 mask, supervise branch_head.
+        # CRITICAL: supervise ALL stages (not just last) so Layers 0/1 learn proper
+        # static/dynamic classification for the hard temporal masking in Layers 1/2.
         if (sam3_mask is not None
                 and gau_preds
-                and gau_preds[-1].branch_logits is not None
                 and 'branch_cls' in self.loss_weights):
-            # Use finest stage for branch supervision
-            gaussian = gau_preds[-1]
-            b_logits = gaussian.branch_logits  # [B, Q, 2] — detached from query features
-            means_3d = gaussian.means  # [B, Q, 3] in world coords
-
-            # dynamic_mask: [N, 1, Rh, Rw] bool, True = NOT dynamic
-            # We need per-Gaussian labels: 1 = dynamic, 0 = static
             Rh, Rw = dynamic_mask.shape[-2:]
             N_cams = W2C.shape[0]
-            B, Q, _ = means_3d.shape
+            dyn_mask_float = (~dynamic_mask).float()  # [N, 1, Rh, Rw] — 1.0=dynamic
 
-            with torch.no_grad():
-                # Project means to each camera: world → camera → pixel
-                # means_3d: [B, Q, 3] → homogeneous [B, Q, 4]
-                ones = torch.ones(*means_3d.shape[:2], 1, device=means_3d.device)
-                means_h = torch.cat([means_3d, ones], dim=-1)  # [B, Q, 4]
+            branch_losses = []
+            for stage_idx, gaussian in enumerate(gau_preds):
+                if gaussian.branch_logits is None:
+                    continue
+                b_logits = gaussian.branch_logits  # [B, Q_stage, 2]
+                means_3d = gaussian.means  # [B, Q_stage, 3]
+                B, Q_stage, _ = means_3d.shape
 
-                # W2C: [N, 4, 4], means_h: [B, Q, 4] → cam coords [N, B, Q, 4]
-                cam_coords = torch.einsum('nij,bqj->nbqi', W2C, means_h)  # [N, B, Q, 4]
-                z = cam_coords[..., 2]  # [N, B, Q] depth in camera frame
+                with torch.no_grad():
+                    ones = torch.ones(B, Q_stage, 1, device=means_3d.device)
+                    means_h = torch.cat([means_3d, ones], dim=-1)  # [B, Q, 4]
+                    cam_coords = torch.einsum('nij,bqj->nbqi', W2C, means_h)
+                    z = cam_coords[..., 2]
+                    pixel_h = torch.einsum('nij,nbqj->nbqi', K[:, :3, :3], cam_coords[..., :3])
+                    u = pixel_h[..., 0] / (z + 1e-6)
+                    v = pixel_h[..., 1] / (z + 1e-6)
 
-                # K: [N, 4, 4] intrinsics, project to pixel
-                pixel_h = torch.einsum('nij,nbqj->nbqi', K[:, :3, :3], cam_coords[..., :3])
-                u = pixel_h[..., 0] / (z + 1e-6)  # [N, B, Q]
-                v = pixel_h[..., 1] / (z + 1e-6)  # [N, B, Q]
+                    u_norm = 2.0 * u / Rw - 1.0
+                    v_norm = 2.0 * v / Rh - 1.0
+                    visible = (z > 0.5) & (u >= 0) & (u < Rw) & (v >= 0) & (v < Rh)
 
-                # Normalize to [-1, 1] for grid_sample
-                u_norm = 2.0 * u / Rw - 1.0
-                v_norm = 2.0 * v / Rh - 1.0
+                    grid = torch.stack([u_norm, v_norm], dim=-1)
+                    grid_flat = grid.reshape(N_cams, -1, 1, 2)
+                    sampled = F.grid_sample(
+                        dyn_mask_float, grid_flat, mode='nearest',
+                        padding_mode='zeros', align_corners=False)
+                    sampled = sampled.reshape(N_cams, B, Q_stage)
 
-                # Visibility mask: z > 0.5 and pixel in bounds
-                visible = (z > 0.5) & (u >= 0) & (u < Rw) & (v >= 0) & (v < Rh)
+                    sampled_masked = sampled * visible.float()
+                    any_dynamic = (sampled_masked.sum(dim=0) > 0.5)
+                    any_visible = (visible.float().sum(dim=0) > 0.5)
+                    gt_dynamic = any_dynamic.float()
 
-                # Sample dynamic_mask at projected positions for each camera
-                # dynamic_mask: [N, 1, Rh, Rw], grid: [N, B*Q, 1, 2]
-                grid = torch.stack([u_norm, v_norm], dim=-1)  # [N, B, Q, 2]
-                grid_flat = grid.reshape(N_cams, -1, 1, 2)  # [N, B*Q, 1, 2]
+                if any_visible.sum() > 10:
+                    valid_logits = b_logits[any_visible]
+                    valid_gt = gt_dynamic[any_visible]
+                    loss_branch_stage = F.binary_cross_entropy_with_logits(
+                        valid_logits[:, 1], valid_gt)
+                    branch_losses.append(loss_branch_stage)
 
-                # dynamic_mask is bool [N, 1, Rh, Rw] — convert to float for sampling
-                dyn_mask_float = (~dynamic_mask).float()  # 1.0 = dynamic, 0.0 = static
-                sampled = F.grid_sample(
-                    dyn_mask_float, grid_flat, mode='nearest',
-                    padding_mode='zeros', align_corners=False)
-                sampled = sampled.reshape(N_cams, B, Q)  # [N, B, Q] — 1.0=dynamic
-
-                # Per-Gaussian label: dynamic if ANY visible camera sees dynamic
-                sampled_masked = sampled * visible.float()  # zero out invisible
-                any_dynamic = (sampled_masked.sum(dim=0) > 0.5)  # [B, Q]
-                any_visible = (visible.float().sum(dim=0) > 0.5)  # [B, Q]
-
-                # GT: 1 = dynamic, 0 = static (only for visible Gaussians)
-                gt_dynamic = any_dynamic.float()  # [B, Q]
-
-            # BCE loss on branch_logits[:, :, 1] (dynamic class logit)
-            if any_visible.sum() > 10:
-                valid_logits = b_logits[any_visible]  # [M, 2]
-                valid_gt = gt_dynamic[any_visible]  # [M]
-                loss_branch = F.binary_cross_entropy_with_logits(
-                    valid_logits[:, 1], valid_gt)
+            if branch_losses:
+                loss_branch = torch.stack(branch_losses).mean()
                 loss_dict['branch_cls'] = loss_branch.item()
                 total_loss = total_loss + loss_branch * self.loss_weights['branch_cls']
 
@@ -854,6 +841,11 @@ class PGOccLightning(pl.LightningModule):
                 self.log('train/tgate_frame0_mean', gate[:, :, 0].mean().item(), sync_dist=True)
                 gate_entropy = -(gate / gate.shape[-1] * (gate / gate.shape[-1] + 1e-8).log()).sum(-1).mean()
                 self.log('train/tgate_entropy', gate_entropy.item(), sync_dist=True)
+
+            # Hard temporal masking diagnostics
+            for li, dl in enumerate(self.decoder.decoder_layers):
+                if hasattr(dl, '_last_dynamic_prob_mean') and dl._last_dynamic_prob_mean is not None:
+                    self.log(f'train/hard_mask_dyn_prob_L{li}', dl._last_dynamic_prob_mean.item(), sync_dist=True)
 
         return total_loss
 

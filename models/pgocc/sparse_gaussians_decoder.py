@@ -222,6 +222,7 @@ class SparseGaussiansDecoder(nn.Module):
                 query_coord = ego_points_coarse[indices].reshape(B, -1, 3)
 
         # --- Progressive decoder layers ---
+        prev_branch_probs = None  # passed from layer i to layer i+1 for temporal masking
         for i, layer in enumerate(self.decoder_layers):
             # Refine depth residual mask for progressive densification
             if i != 0:
@@ -292,7 +293,8 @@ class SparseGaussiansDecoder(nn.Module):
             anisotropy_info = None
 
             query_feat_part = query_feat[:, :query_bbox.size(1)]
-            query_feat_part = layer(query_feat_part, query_bbox, mlvl_feats, anisotropy_info, img_metas)
+            query_feat_part = layer(query_feat_part, query_bbox, mlvl_feats, anisotropy_info, img_metas,
+                                    prev_branch_probs=prev_branch_probs)
 
             gau_pred = self.gau_pred_heads[i](query_feat_part)
             all_scales, all_rots, all_opacities = [], [], []
@@ -363,6 +365,7 @@ class SparseGaussiansDecoder(nn.Module):
             # Detach features — branch classification must NOT corrupt shared features
             b_logits = self.branch_heads[i](query_feat_part.detach())  # [B, Q, 2]
             b_probs = torch.softmax(b_logits, dim=-1)  # [B, Q, 2]
+            prev_branch_probs = b_probs  # feed to next layer for temporal masking
 
             pred_gaussians = GaussianPrediction(
                 means=query_coord,
@@ -467,7 +470,8 @@ class SparseGaussiansDecoderLayer(nn.Module):
         nn.init.zeros_(self.temporal_gate[-1].weight)
         nn.init.zeros_(self.temporal_gate[-1].bias)
 
-    def forward(self, query_feat, query_3dgs, mlvl_feats, anisotropy_info, img_metas):
+    def forward(self, query_feat, query_3dgs, mlvl_feats, anisotropy_info, img_metas,
+                prev_branch_probs=None):
         query_pos = self.position_encoder(query_3dgs[..., :3])
         query_feat = query_feat + query_pos
         if self.self_attn is not None:
@@ -476,14 +480,41 @@ class SparseGaussiansDecoderLayer(nn.Module):
         sampled_feat = self.sampling(query_3dgs, query_feat, mlvl_feats, anisotropy_info, img_metas)
         # sampled_feat: [B, Q, G, T*P, C]
 
-        # Temporal attention gate: weight each frame's features per query.
-        # Static queries → uniform (all frames useful).
-        # Dynamic queries → concentrate on current frame (past frames = noise).
         B, Q, G, TP, C = sampled_feat.shape
         T, P = self.num_frames, self.num_points
+
+        # Hard branch-conditioned temporal masking (SelfOccFlow-inspired):
+        # Dynamic queries: replace past-frame features with current-frame copies
+        #   → AdaptiveMixing sees consistent features from frame 0 only
+        # Static queries: keep all temporal frames for multi-frame consistency
+        # prev_branch_probs comes from the PREVIOUS decoder layer's branch_head.
+        if prev_branch_probs is not None and T > 1:
+            sampled_feat = sampled_feat.view(B, Q, G, T, P, C)
+
+            # prev_branch_probs may cover fewer queries than current layer
+            n_prev = min(prev_branch_probs.size(1), Q)
+            dynamic_prob = torch.zeros(B, Q, device=sampled_feat.device)
+            dynamic_prob[:, :n_prev] = prev_branch_probs[:, :n_prev, 1].detach()
+
+            current_frame = sampled_feat[:, :, :, 0:1, :, :]  # [B, Q, G, 1, P, C]
+            current_expanded = current_frame.expand_as(sampled_feat)
+
+            # Blend: past frames interpolate toward current frame based on dynamic_prob
+            dp = dynamic_prob[:, :, None, None, None, None]  # [B, Q, 1, 1, 1, 1]
+            past_mask = torch.zeros(1, 1, 1, T, 1, 1, device=sampled_feat.device)
+            past_mask[:, :, :, 1:, :, :] = 1.0  # 1.0 for past frames only
+
+            sampled_feat = sampled_feat * (1 - past_mask * dp) + current_expanded * (past_mask * dp)
+            sampled_feat = sampled_feat.reshape(B, Q, G, TP, C)
+            self._last_dynamic_prob_mean = dynamic_prob.mean().detach()
+        else:
+            self._last_dynamic_prob_mean = None
+
+        # Learned temporal gate (diagnostic + fine-tuning on top of hard mask).
+        # Kept for checkpoint compatibility; starts as identity (zero-init → uniform).
         gate_logits = self.temporal_gate(query_feat)  # [B, Q, T]
         gate = F.softmax(gate_logits, dim=-1) * T  # uniform gate = 1.0 per frame
-        self._last_gate = gate.detach()  # store for diagnostics
+        self._last_gate = gate.detach()
 
         sampled_feat = sampled_feat.view(B, Q, G, T, P, C)
         sampled_feat = sampled_feat * gate[:, :, None, :, None, None]
