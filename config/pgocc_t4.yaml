@@ -57,6 +57,9 @@ model:
     depth_gt: 0.05         # Reverted to fixv23 — sparse LiDAR as gentle regularizer
     sem_ce: 1.0            # MLP-based class head (absorbs classification gradient)
     sem_text: 0.5          # Text contrastive loss (gentle text-prototype alignment)
+    # Phase 1: dynamic-aware supervision (SelfOccFlow-inspired)
+    dyn_cov: 0.5           # BCE(alpha, 1.0) on dynamic pixels — prevent model from erasing dynamic objects
+    dyn_depth: 0.5         # L1(depth, foundation_depth) on dynamic pixels — geometry supervision
     # Phase 2: per-Gaussian static/dynamic classification (SelfOccFlow-inspired)
     branch_cls: 0.5        # BCE on branch_head logits vs SAM3 projected labels (no render)
   warp_warmup_epochs: 0.25  # ¼ epoch ≈ 5.5k steps (original PG-Occ used ~3.5k on nuScenes)
