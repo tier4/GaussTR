@@ -668,7 +668,10 @@ class PGOccLightning(pl.LightningModule):
                     ce = F.cross_entropy(class_logits, targets.long(), reduction='none')
                     loss_sem_ce = (ce * valid.float()).sum() / valid.float().sum()
                     loss_dict[f'sem_ce_{i}'] = loss_sem_ce.item()
-                    total_loss = total_loss + loss_sem_ce * self.loss_weights['sem_ce']
+                    # Warmup: class_head MLP is randomly initialized, so its gradients
+                    # are noise at step 0. Ramp up to avoid corrupting pretrained OV features.
+                    sem_ce_warmup = min(1.0, self.global_step / 300.0)
+                    total_loss = total_loss + loss_sem_ce * self.loss_weights['sem_ce'] * sem_ce_warmup
 
             # Text contrastive loss (gentle text-prototype alignment alongside MLP-based sem_ce)
             if (sam3_mask is not None and gaussian.ovs is not None
