@@ -47,9 +47,11 @@ class SparseGaussiansDecoder(nn.Module):
                  ov_dim=768,
                  restrict_xyz=True,
                  use_anisotropy_encoding=True,
-                 scale_range=(0.0, 2.0)):
+                 scale_range=(0.0, 2.0),
+                 use_hard_mask=True):
         super().__init__()
         self.scale_range = scale_range
+        self.use_hard_mask = use_hard_mask
 
         self.embed_dims = embed_dims
         self.num_frames = num_frames
@@ -123,6 +125,10 @@ class SparseGaussiansDecoder(nn.Module):
             )
             for _ in range(len(self.layers_scales))
         ])
+        # Freeze branch_heads when not supervised — random params waste optimizer capacity
+        if not use_hard_mask:
+            for p in self.branch_heads.parameters():
+                p.requires_grad = False
 
     @torch.no_grad()
     def init_weights(self):
@@ -222,7 +228,7 @@ class SparseGaussiansDecoder(nn.Module):
                 query_coord = ego_points_coarse[indices].reshape(B, -1, 3)
 
         # --- Progressive decoder layers ---
-        prev_branch_probs = None  # passed from layer i to layer i+1 for temporal masking
+        prev_branch_probs = None  # passed from layer i to layer i+1 for temporal masking (only when use_hard_mask=True)
         for i, layer in enumerate(self.decoder_layers):
             # Refine depth residual mask for progressive densification
             if i != 0:
@@ -294,7 +300,7 @@ class SparseGaussiansDecoder(nn.Module):
 
             query_feat_part = query_feat[:, :query_bbox.size(1)]
             query_feat_part = layer(query_feat_part, query_bbox, mlvl_feats, anisotropy_info, img_metas,
-                                    prev_branch_probs=prev_branch_probs)
+                                    prev_branch_probs=prev_branch_probs if self.use_hard_mask else None)
 
             gau_pred = self.gau_pred_heads[i](query_feat_part)
             all_scales, all_rots, all_opacities = [], [], []
@@ -437,15 +443,15 @@ class SparseGaussiansDecoderLayer(nn.Module):
             use_anisotropy_encoding=use_anisotropy_encoding,
         )
 
-        # Temporal attention gate (SelfOccFlow-inspired): per-query weighting
-        # of T temporal frames. Lets dynamic queries suppress noisy past-frame
-        # features while static queries keep uniform temporal aggregation.
-        # Zero-init → softmax(zeros) = 1/T → uniform → identity at init.
+        # Temporal gate — DISABLED at runtime but kept for checkpoint compat.
+        # Drifts from identity during training and corrupts temporal features.
         self.temporal_gate = nn.Sequential(
             nn.Linear(embed_dims, embed_dims // 4),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims // 4, num_frames),
         )
+        for p in self.temporal_gate.parameters():
+            p.requires_grad = False
 
         self.mixing = AdaptiveMixing(
             in_dim=embed_dims,
@@ -510,15 +516,10 @@ class SparseGaussiansDecoderLayer(nn.Module):
         else:
             self._last_dynamic_prob_mean = None
 
-        # Learned temporal gate (diagnostic + fine-tuning on top of hard mask).
-        # Kept for checkpoint compatibility; starts as identity (zero-init → uniform).
-        gate_logits = self.temporal_gate(query_feat)  # [B, Q, T]
-        gate = F.softmax(gate_logits, dim=-1) * T  # uniform gate = 1.0 per frame
-        self._last_gate = gate.detach()
-
-        sampled_feat = sampled_feat.view(B, Q, G, T, P, C)
-        sampled_feat = sampled_feat * gate[:, :, None, :, None, None]
-        sampled_feat = sampled_feat.reshape(B, Q, G, TP, C)
+        # Temporal gate DISABLED: it drifts from identity during training and
+        # disrupts converged temporal features. See fixv36a trend analysis.
+        # Module kept in __init__ for checkpoint compatibility only.
+        self._last_gate = None
 
         query_feat = self.norm2(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))

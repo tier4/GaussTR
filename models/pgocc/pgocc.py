@@ -197,6 +197,7 @@ class PGOccLightning(pl.LightningModule):
             pc_range=pc_range,
             ov_dim=ov_dim if use_ov else 0,
             render_conf=self.render_conf,
+            use_hard_mask=self.loss_weights.get('branch_cls', 0) > 0,
         )
         self.decoder.init_weights()
 
@@ -568,11 +569,33 @@ class PGOccLightning(pl.LightningModule):
             render_depth_ed = render_depth_ed.clamp(min=0.1, max=80.0)
             alpha_mask = (render_alphas > 0.1).detach()
 
-            # Temporal depth warping loss (blended depth — branch routing is classification-only)
-            warp_full_mask = warp_pixel_mask & alpha_mask
+            # Phase 2 (SelfOccFlow): static-only rendering for warp loss
+            # Multiply opacity by p_static so dynamic objects don't contribute to depth warping.
+            # This makes warp loss focus on static background, which is consistent across frames.
+            use_static_warp = (self.loss_weights.get('branch_cls', 0) > 0
+                               and gaussian.branch_probs is not None)
+            if use_static_warp:
+                static_gaussian = GaussianPrediction(
+                    means=gaussian.means,
+                    scales=gaussian.scales,
+                    rotations=gaussian.rotations,
+                    opacities=gaussian.opacities * gaussian.branch_probs[..., 0].detach(),
+                    ovs=gaussian.ovs,
+                )
+                static_render = batch_splatting_render(
+                    static_gaussian, W2C, K, render_conf=self.render_conf, inference=True)
+                warp_depth = static_render['depth'].permute(0, 3, 1, 2).clamp(min=0.1, max=80.0)
+                warp_alpha_mask = (static_render['alphas'].permute(0, 3, 1, 2) > 0.1).detach()
+            else:
+                warp_depth = render_depth_ed
+                warp_alpha_mask = alpha_mask
+
+            # Temporal depth warping loss
+            # NOTE: do NOT add alpha_mask here — fixv23 proved warp needs all pixels
+            warp_full_mask = warp_pixel_mask
             do_warp_diag = (i == 0 and batch_idx % 50 == 0)
             loss_warp_result = calc_time_warping_loss(
-                render_depth_ed[0:self.num_cams],
+                warp_depth[0:self.num_cams],
                 batch['t0_2_x_geo'], batch['render_gt'],
                 self.backproject_depth, self.project_3d, K,
                 num_cams=self.num_cams, valid_row=valid_row,
@@ -649,7 +672,9 @@ class PGOccLightning(pl.LightningModule):
             if (sam3_mask is not None and gaussian.ovs is not None
                     and 'sem_ce' in self.loss_weights):
                 # ov_feature: [1, N, Rh, Rw, D_pca] — rendered PCA-projected features
-                ov_rendered = ov_feature.squeeze(0)  # [N, Rh, Rw, D_pca]
+                # DETACH: sem_ce gradient must NOT flow back through renderer to corrupt OV features.
+                # Only class_head MLP receives gradient; ov_mse/ov_cos remain the sole OV shapers.
+                ov_rendered = ov_feature.squeeze(0).detach()  # [N, Rh, Rw, D_pca]
                 # class_head MLP: [N, Rh, Rw, D_pca] → [N, Rh, Rw, 16] → [N, 16, Rh, Rw]
                 class_logits = self.class_head(ov_rendered).permute(0, 3, 1, 2)
 
@@ -677,7 +702,8 @@ class PGOccLightning(pl.LightningModule):
             if (sam3_mask is not None and gaussian.ovs is not None
                     and 'sem_text' in self.loss_weights
                     and self.text_proto_embeds_sam3 is not None):
-                ov_rendered = ov_feature.squeeze(0)  # [N, Rh, Rw, D_pca]
+                # DETACH: same as sem_ce — text contrastive must not corrupt OV features
+                ov_rendered = ov_feature.squeeze(0).detach()  # [N, Rh, Rw, D_pca]
                 # Project PCA features to full OV space for text similarity
                 # pca_v: [ov_dim, reduce_dims] → transpose to [reduce_dims, ov_dim]
                 ov_full = ov_rendered @ pca_v.to(ov_rendered).T  # [N, Rh, Rw, ov_dim]
@@ -836,11 +862,10 @@ class PGOccLightning(pl.LightningModule):
             warp_coverage = warp_pixel_mask.float().mean().item()
             self.log('train/warp_mask_coverage', warp_coverage, sync_dist=True)
 
-            # Temporal gate diagnostics: how much does frame 0 (current) dominate?
+            # Temporal gate diagnostics (disabled — gate frozen as identity)
             last_layer = self.decoder.decoder_layers[-1]
-            if hasattr(last_layer, '_last_gate'):
-                gate = last_layer._last_gate  # [B, Q, T], scaled by T
-                # gate=1.0 per frame means uniform; gate[0]>1 means current frame dominates
+            gate = getattr(last_layer, '_last_gate', None)
+            if gate is not None:
                 self.log('train/tgate_frame0_mean', gate[:, :, 0].mean().item(), sync_dist=True)
                 gate_entropy = -(gate / gate.shape[-1] * (gate / gate.shape[-1] + 1e-8).log()).sum(-1).mean()
                 self.log('train/tgate_entropy', gate_entropy.item(), sync_dist=True)
