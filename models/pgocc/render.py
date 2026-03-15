@@ -5,7 +5,7 @@ import numpy as np
 from gsplat import rasterization
 
 
-def batch_splatting_render(pc, w2c, Ks, render_conf, inference=False):
+def batch_splatting_render(pc, w2c, Ks, render_conf, inference=False, detach_spatial=False):
     """Render Gaussians to depth and OV feature maps using gsplat.
 
     Args:
@@ -14,6 +14,8 @@ def batch_splatting_render(pc, w2c, Ks, render_conf, inference=False):
         Ks: Camera intrinsics [N, 3, 3] or [N, 4, 4]
         render_conf: Dict with 'render_w' and 'render_h'
         inference: If True, only render depth (skip OV)
+        detach_spatial: If True, detach means/scales/rotations/opacities so gradients
+                        only flow to OV feature embeddings (not Gaussian geometry).
 
     Returns:
         Dict with 'depth', optionally 'ov_feature', 'alphas', 'meta'
@@ -30,6 +32,12 @@ def batch_splatting_render(pc, w2c, Ks, render_conf, inference=False):
         quats = pc.rotations.squeeze(0).float()
         scales = pc.scales.squeeze(0).float()
         opacities = pc.opacities.squeeze(0).float()
+
+    if detach_spatial:
+        means = means.detach()
+        quats = quats.detach()
+        scales = scales.detach()
+        opacities = opacities.detach()
 
     Ks = Ks[:, :3, :3]
     width, height = render_conf['render_w'], render_conf['render_h']

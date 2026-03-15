@@ -657,7 +657,12 @@ class PGOccLightning(pl.LightningModule):
                 total_loss = total_loss + loss_ov_mse * self.loss_weights['ov_mse']
 
                 # Cosine similarity loss (masked)
-                ov_normed = ov_feature / (ov_feature.norm(dim=-1, keepdim=True) + 1e-8)
+                # Render with detached spatial params so ov_cos only updates OV feature
+                # embeddings, not Gaussian geometry (prevents ov_cos from competing with warp).
+                ov_cos_render = batch_splatting_render(
+                    gaussian, W2C, K, render_conf=self.render_conf, detach_spatial=True)
+                ov_feature_for_cos = ov_cos_render['ov_feature'].unsqueeze(0)
+                ov_normed = ov_feature_for_cos / (ov_feature_for_cos.norm(dim=-1, keepdim=True) + 1e-8)
                 tgt_normed = ov_tgt_feature / (ov_tgt_feature.norm(dim=-1, keepdim=True) + 1e-8)
                 cos_sim = F.cosine_similarity(
                     ov_normed.reshape(-1, D), tgt_normed.reshape(-1, D))
