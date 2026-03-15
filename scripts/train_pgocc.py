@@ -175,6 +175,7 @@ def main(cfg: DictConfig) -> None:
     trainer_cfg = OmegaConf.to_container(cfg.get('trainer', {}), resolve=True)
     trainer = pl.Trainer(
         max_epochs=trainer_cfg.get('max_epochs', 8),
+        max_steps=trainer_cfg.get('max_steps', -1),
         accelerator=trainer_cfg.get('accelerator', 'gpu'),
         devices=trainer_cfg.get('devices', 'auto'),
         strategy=trainer_cfg.get('strategy', 'ddp'),
