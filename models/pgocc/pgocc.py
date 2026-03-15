@@ -57,6 +57,7 @@ class PGOccLightning(pl.LightningModule):
         # Losses
         loss_weights: dict = None,
         warp_warmup_epochs: float = 2,
+        ov_cos_warmup_epochs: float = 0,
         # Masking
         ego_car_mask_dir: str = "",
         ego_car_mask_map: dict = None,
@@ -122,6 +123,7 @@ class PGOccLightning(pl.LightningModule):
         self.num_frames = num_frames
         self.loss_weights = loss_weights
         self.warp_warmup_epochs = warp_warmup_epochs
+        self.ov_cos_warmup_epochs = ov_cos_warmup_epochs
         self.density_threshold = density_threshold
         self.render_conf = dict(render_h=render_h, render_w=render_w)
         self.img_color_aug = img_color_aug
@@ -546,14 +548,19 @@ class PGOccLightning(pl.LightningModule):
             ov_pixel_mask = ego_mask
 
         # Smooth per-step warp warmup (replaces epoch-based jumps)
+        total_steps = self.trainer.estimated_stepping_batches
+        max_epochs = self.trainer.max_epochs
+        steps_per_epoch = max(1, total_steps // max(1, max_epochs))
         if self.warp_warmup_epochs > 0:
-            total_steps = self.trainer.estimated_stepping_batches
-            max_epochs = self.trainer.max_epochs
-            steps_per_epoch = max(1, total_steps // max(1, max_epochs))
             warp_warmup_steps = self.warp_warmup_epochs * steps_per_epoch
             warp_factor = min(1.0, self.training_iter / max(1, warp_warmup_steps))
         else:
             warp_factor = 1.0
+        if self.ov_cos_warmup_epochs > 0:
+            ov_cos_warmup_steps = self.ov_cos_warmup_epochs * steps_per_epoch
+            ov_cos_factor = min(1.0, self.training_iter / max(1, ov_cos_warmup_steps))
+        else:
+            ov_cos_factor = 1.0
 
         for i, gaussian in enumerate(gau_preds):
             # Apply PCA to predicted OV features
@@ -657,12 +664,7 @@ class PGOccLightning(pl.LightningModule):
                 total_loss = total_loss + loss_ov_mse * self.loss_weights['ov_mse']
 
                 # Cosine similarity loss (masked)
-                # Render with detached spatial params so ov_cos only updates OV feature
-                # embeddings, not Gaussian geometry (prevents ov_cos from competing with warp).
-                ov_cos_render = batch_splatting_render(
-                    gaussian, W2C, K, render_conf=self.render_conf, detach_spatial=True)
-                ov_feature_for_cos = ov_cos_render['ov_feature'].unsqueeze(0)
-                ov_normed = ov_feature_for_cos / (ov_feature_for_cos.norm(dim=-1, keepdim=True) + 1e-8)
+                ov_normed = ov_feature / (ov_feature.norm(dim=-1, keepdim=True) + 1e-8)
                 tgt_normed = ov_tgt_feature / (ov_tgt_feature.norm(dim=-1, keepdim=True) + 1e-8)
                 cos_sim = F.cosine_similarity(
                     ov_normed.reshape(-1, D), tgt_normed.reshape(-1, D))
@@ -670,7 +672,7 @@ class PGOccLightning(pl.LightningModule):
                 cos_count = cos_mask_flat.sum().clamp(min=1.0)
                 loss_ov_cos = 1.0 - (cos_sim * cos_mask_flat).sum() / cos_count
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
-                total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos']
+                total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos'] * ov_cos_factor
 
             # SAM3 semantic classification loss via class_head MLP (ported from GaussTR)
             # The MLP absorbs classification gradient — features stay aligned with DINOv3CLIP.
@@ -859,6 +861,7 @@ class PGOccLightning(pl.LightningModule):
         # Log losses
         self.log('train_loss', total_loss, prog_bar=True, sync_dist=True)
         self.log('train/warp_factor', warp_factor, sync_dist=True)
+        self.log('train/ov_cos_factor', ov_cos_factor, sync_dist=True)
         for k, v in loss_dict.items():
             self.log(f'train/{k}', v, sync_dist=True)
 
