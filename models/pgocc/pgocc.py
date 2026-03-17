@@ -58,6 +58,7 @@ class PGOccLightning(pl.LightningModule):
         loss_weights: dict = None,
         warp_warmup_epochs: float = 2,
         ov_cos_warmup_epochs: float = 0,
+        ov_cos_static_only: bool = False,
         # Masking
         ego_car_mask_dir: str = "",
         ego_car_mask_map: dict = None,
@@ -124,6 +125,7 @@ class PGOccLightning(pl.LightningModule):
         self.loss_weights = loss_weights
         self.warp_warmup_epochs = warp_warmup_epochs
         self.ov_cos_warmup_epochs = ov_cos_warmup_epochs
+        self.ov_cos_static_only = ov_cos_static_only
         self.density_threshold = density_threshold
         self.render_conf = dict(render_h=render_h, render_w=render_w)
         self.img_color_aug = img_color_aug
@@ -645,7 +647,24 @@ class PGOccLightning(pl.LightningModule):
 
             # OV feature losses (masked to backbone-visible region + ego mask)
             if gaussian.ovs is not None:
-                ov_feature = render_results['ov_feature'].unsqueeze(0)  # [1, N, Rh, Rw, D]
+                # Static-only OV rendering: apply ov_cos only to static Gaussians
+                # (dynamic objects have temporally inconsistent positions → conflicting OV gradients)
+                use_static_ov = (self.ov_cos_static_only
+                                 and self.loss_weights.get('branch_cls', 0) > 0
+                                 and gaussian.branch_probs is not None)
+                if use_static_ov:
+                    static_ov_gaussian = GaussianPrediction(
+                        means=gaussian.means,
+                        scales=gaussian.scales,
+                        rotations=gaussian.rotations,
+                        opacities=gaussian.opacities * gaussian.branch_probs[..., 0].detach(),
+                        ovs=gaussian.ovs,
+                    )
+                    static_ov_render = batch_splatting_render(
+                        static_ov_gaussian, W2C, K, render_conf=self.render_conf)
+                    ov_feature = static_ov_render['ov_feature'].unsqueeze(0)  # [1, N, Rh, Rw, D]
+                else:
+                    ov_feature = render_results['ov_feature'].unsqueeze(0)  # [1, N, Rh, Rw, D]
 
                 # Build OV spatial mask: ego car + valid_row (no alpha_mask — supervise low-alpha regions)
                 ov_mask_spatial = ov_pixel_mask.float()  # [N, 1, Rh, Rw]
