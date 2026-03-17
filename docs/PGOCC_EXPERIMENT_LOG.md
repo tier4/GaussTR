@@ -298,3 +298,81 @@ SelfOccFlow 最有价值的部分：训练时多帧静态 Gaussian 融合
 | `7c2f223` | feat: temporal attention gate (失败) |
 | `3bb2f53` | feat: hard temporal masking + all-stage branch supervision |
 | `e555b80` | fix: warmup sem_ce to prevent OV corruption |
+| `6624800` | fix: pass max_steps to pl.Trainer |
+| `e542f69` | docs: experiment log Section 7 (max_steps bug + 4/4 IMPROVED first achievement) |
+| `69721f2` | feat: ov_cos_static_only flag (static-only OV rendering) |
+
+---
+
+## 8. Autoresearch 自主实验记录 (Mar16-Mar17 session)
+
+### 关键发现 1: warmup bug 修复 (max_epochs=999 → max_epochs=1)
+
+**问题**: 之前所有使用 `ov_cos_warmup_epochs` 的实验中，warmup 完全无效。
+**根因**: `trainer.max_epochs=999` 导致 `steps_per_epoch = max_steps//999 ≈ 3`，所以 `warmup_steps = 0.5 * 3 = 1.5` ≈ 0。
+**修复**: 改为 `trainer.max_epochs=1`，使 `steps_per_epoch = max_steps = 3000/4000`。
+**效果** (ar_mar16_014 vs ar_mar16_005):
+- ov_cos 从 -2.1% → -5.2% (2.5x 提升!)
+- depth_0 从 -6.4% → -5.7% (稍有下降)
+- warmup 有效防止 OV 竞争在早期破坏几何收敛
+
+### 关键发现 2: max_steps=4000 显著改善 ov_cos
+
+**发现**: 增加训练步数是提升 ov_cos 的主要杠杆。
+| 步数 | warmup | ov_cos | depth_0 |
+|------|--------|--------|---------|
+| 3000 | 0.5 | -5.2% | -5.7% |
+| 3500 (partial) | 0.5 | -10.3% | -6.4% |
+| 4000 | 0.5 | -15.6% | -4.0% |
+| 4000 | 0.7 | -15.3% | -4.5% |
+
+**结论**: 总步数是 ov_cos 收敛的主要决定因素，不是 warmup 比例。收敛需要更多 step 让 OV 特征质量提升。
+
+### 关键发现 3: ov_mse=0 是 4000 步的严格 Pareto 改进
+
+**发现**: `ov_mse=10.0`（默认值）在 4000 步时是对抗性的，但在 3000 步时有益。
+- 4000 步: ov_mse=10.0 → depth_0 **-4.0%**; ov_mse=0 → depth_0 **-4.9%** (同样 ov_cos -15.6%)
+- 3000 步: ov_mse=0 → depth_0 **-5.3%** (vs ov_mse=10.0 的 **-5.7%**, 更差!)
+**原因**: ov_mse 的 L2 梯度在早期帮助 OV 对齐（有益），但在后期阻止 Gaussian 移动到更好的深度位置（有害）。
+**教训**: 4000 步 config 必须用 `ov_mse=0`；3000 步 config 保留 `ov_mse=10.0`。
+
+### 关键发现 4: warp 收敛与 depth_warping 权重无关
+
+**发现**: `warp_0` 精确收敛到 -16.4%，无论 depth_warping=2.0, 3.0 还是 5.0。
+**含义**: warp 收敛是模型容量/数据决定的，不是损失权重决定的。可以安全降低 depth_warping 到 3.0 (为其他 loss 释放梯度预算)，depth_warping=3.0 时 depth_gt 稍有改善 (-2.8% vs -2.4%)。
+
+### 关键发现 5: depth_foundation=1.0 是 depth_0 的主要驱动力
+
+**发现**: `depth_foundation=0.5` → depth_0 FLAT（不收敛），ov_cos -17.5%（最高！），depth_gt -3.5%（最高！）
+**含义**: depth_foundation 是 depth_0 的主要监督信号。减少它会让 depth_0 无法收敛，但 ov_cos 和 depth_gt 大幅改善（因为少了竞争）。
+**结论**: depth_foundation=1.0 是 depth_0 IMPROVED 的必要条件，不能降低。
+
+### 关键发现 6: static-only ov_cos 失败
+
+**实验**: `ov_cos_static_only=True`（只在静态 Gaussian 上计算 ov_cos）
+**结果**: ov_cos 崩溃到 -2.5%（vs -15.6%），depth_0 -4.6%。
+**原因**: 动态对象占据大量像素，去掉它们的 OV 监督会严重损害 OV 特征质量。
+**教训**: ov_cos 必须应用到所有 Gaussian；不能用静态分支来减少 OV-depth 冲突。
+
+### 当前最优 4000 步配置 (ar_mar16_024)
+
+| 参数 | 值 |
+|------|-----|
+| `max_steps` | 4000 |
+| `max_epochs` | 1 |
+| `ov_mse` | **0.0** (关键！) |
+| `ov_cos` | 7.0 |
+| `depth_gt` | 0.3 |
+| `depth_foundation` | 1.0 |
+| `depth_warping` | 5.0 |
+| `dyn_cov/dyn_depth` | 1.0 |
+| `branch_cls` | 0.5 |
+| `ov_cos_warmup_epochs` | 0.5 |
+
+**结果**: depth_0 **-4.9%**, ov_cos **-15.6%**, warp **-16.4%**, depth_gt **-2.4%** (4/4 IMPROVED)
+
+### 下一步方向
+
+1. **Phase 3 SelfOccFlow**: 静态时域聚合 — 多帧 Gaussian 融合，需要代码修改
+2. **reduce_dims 调参**: 当前 128 维 PCA；64 维可能让 ov_cos 更稳健
+3. **增加 num_queries**: 更多 fine Gaussian (1000→2000) 可能改善场景覆盖
