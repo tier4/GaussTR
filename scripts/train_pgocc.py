@@ -131,7 +131,18 @@ def main(cfg: DictConfig) -> None:
             print(f"Loading weights from: {cfg.load_from}")
         checkpoint = torch.load(cfg.load_from, map_location='cpu')
         state_dict = checkpoint.get('state_dict', checkpoint)
-        model.load_state_dict(state_dict, strict=False)
+        # Filter out shape-mismatched parameters so architectural changes
+        # (e.g. different num_queries) don't crash loading.
+        model_state = model.state_dict()
+        filtered_sd = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        missing = [k for k in model_state if k not in filtered_sd]
+        if is_main and missing:
+            print(f"[load_from] Skipped {len(state_dict)-len(filtered_sd)} shape-mismatched params; "
+                  f"{len(missing)} model params use random init")
+        model.load_state_dict(filtered_sd, strict=False)
 
     # Build datamodule
     data_cfg = OmegaConf.to_container(cfg.data, resolve=True)
