@@ -59,6 +59,7 @@ class PGOccLightning(pl.LightningModule):
         warp_warmup_epochs: float = 2,
         ov_cos_warmup_epochs: float = 0,
         ov_cos_static_only: bool = False,
+        ov_reduce_dims: int = 128,
         # Masking
         ego_car_mask_dir: str = "",
         ego_car_mask_map: dict = None,
@@ -146,7 +147,7 @@ class PGOccLightning(pl.LightningModule):
         self.register_buffer('img_std', torch.tensor(std).view(1, 3, 1, 1))
 
         # === EMA PCA for stable dimensionality reduction (ported from GaussTR) ===
-        reduce_dims = 128
+        reduce_dims = ov_reduce_dims
         self.reduce_dims = reduce_dims
         self.pca_ema_momentum = 0.1
         self.register_buffer('pca_v', torch.zeros(ov_dim, reduce_dims))
