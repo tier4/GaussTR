@@ -354,25 +354,77 @@ SelfOccFlow 最有价值的部分：训练时多帧静态 Gaussian 融合
 **原因**: 动态对象占据大量像素，去掉它们的 OV 监督会严重损害 OV 特征质量。
 **教训**: ov_cos 必须应用到所有 Gaussian；不能用静态分支来减少 OV-depth 冲突。
 
-### 当前最优 4000 步配置 (ar_mar16_024)
+### 当前最优 4000 步配置 ~~(ar_mar16_024)~~ → **ar_mar17_013**
 
-| 参数 | 值 |
-|------|-----|
-| `max_steps` | 4000 |
-| `max_epochs` | 1 |
-| `ov_mse` | **0.0** (关键！) |
-| `ov_cos` | 7.0 |
-| `depth_gt` | 0.3 |
-| `depth_foundation` | 1.0 |
-| `depth_warping` | 5.0 |
-| `dyn_cov/dyn_depth` | 1.0 |
-| `branch_cls` | 0.5 |
-| `ov_cos_warmup_epochs` | 0.5 |
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `max_steps` | 4000 | |
+| `max_epochs` | 1 | 不能用 999！ |
+| `ov_mse` | **0.0** | 关键！4000 步对抗性 |
+| `ov_cos` | 7.0 | Pareto 最优 |
+| `depth_gt` | 0.3 | 最佳绝对 depth_0/ov_cos |
+| `depth_foundation` | 1.0 | depth_0 主驱动力 |
+| `depth_warping` | 5.0 | warp 收敛与权重无关 |
+| `dyn_cov/dyn_depth` | 1.0 | |
+| `branch_cls` | 0.5 | |
+| `ov_cos_warmup_epochs` | 0.5 | |
+| **`num_queries`** | **[4000,2000,4000]** | **关键新发现！10K Gaussians** |
 
-**结果**: depth_0 **-4.9%**, ov_cos **-15.6%**, warp **-16.4%**, depth_gt **-2.4%** (4/4 IMPROVED)
+**结果 (ar_mar17_013)**: depth_0 **-5.6%**, ov_cos **-16.6%**, warp **-16.4%**, depth_gt **-3.4%** (4/4 IMPROVED)
+**绝对 Seg5 质量**: depth_0=0.5101, ov_cos=0.0601, warp=0.1346, depth_gt=1.7756
+
+---
+
+## 9. Autoresearch 自主实验记录 (Mar17-Mar19 session)
+
+### 关键发现 1: num_queries=[4000,2000,4000] 是严格 Pareto 改进
+
+**发现**: 增加 medium (1000→2000) 和 fine (1000→4000) Gaussian 数量，ALL 4 metrics 同时改善。
+| num_queries | 总量 | depth_0 | ov_cos | depth_gt |
+|-------------|------|---------|--------|----------|
+| [4000,1000,1000] | 6K | -4.9% | -15.6% | -2.4% |
+| [4000,1000,2000] | 7K | -4.6% | -15.8% | -3.2% |
+| [4000,2000,2000] | 8K | -5.2% | -15.6% | -3.2% |
+| **[4000,2000,4000]** | **10K** | **-5.6%** | **-16.6%** | **-3.4%** |
+| [4000,4000,4000] | 12K | -4.8% | -16.9% | -3.2% |
+| [4000,2000,6000] | 12K | timeout/partial | | |
+
+**原因**: 更多 Gaussian 提供更密集的场景覆盖。fine 级别 Gaussian 可以精确对齐稀疏 LiDAR 点。
+**注意**: [4000,4000,4000] 反而更差，因为额外的 medium query 从随机初始化开始需要更多训练时间。
+
+### 关键发现 2: 10K Gaussians 使 depth_gt 权重重新可调
+
+之前 6K Gaussians 下 depth_gt=0.4 会显著损害 depth_0 (-3.5%)。10K Gaussians 下：
+| depth_gt | depth_0 | ov_cos | depth_gt metric |
+|----------|---------|--------|-----------------|
+| 0.3 | -5.6% | -16.6% | -3.4% |
+| 0.5 | -4.1% | -16.2% | -5.8% |
+| 1.0 | -4.6% | -13.9% | -10.3% |
+| 2.0 | -5.9%\* | -13.9% | -15.5% |
+
+\*注意: depth_gt=2.0 的 depth_0 -5.9% 是相对改善率高，但绝对 Seg5 值 0.6208 远差于 depth_gt=0.3 的 0.5101。
+**重要**: 段趋势评估测量的是收敛速度，不是绝对质量。实际模型质量应看绝对 Seg5 值。
+
+### 关键发现 3: ov_cos=7.0 在 10K Gaussians 下仍然是最优
+
+| ov_cos | depth_0 (Seg5 绝对值) | ov_cos (Seg5 绝对值) |
+|--------|----------------------|---------------------|
+| 7.0 | 0.5101 ✅ | 0.0601 |
+| 8.0 | 0.5127 | 0.0595 |
+| 9.0 | 0.5173 | 0.0590 |
+
+ov_cos=7.0 提供最好的绝对 depth_0 质量，ov_cos 差异很小。
+
+### 关键发现 4: 其他失败的方向
+
+- **dyn_cov/dyn_depth=2.0**: 竞争梯度预算，所有指标变差
+- **depth_warping=3.0**: 与 5.0 几乎相同效果
+- **branch_cls=1.0**: 与 0.5 功能等价（10K Gaussians 下）
+- **ov_mse=5.0**: 与 ov_mse=0.0 几乎相同（10K Gaussians 下稀释了 ov_mse 影响）
+- **3000步+ov_mse=10+10K**: 更好的相对趋势但绝对质量略差于 4000 步
 
 ### 下一步方向
 
-1. **Phase 3 SelfOccFlow**: 静态时域聚合 — 多帧 Gaussian 融合，需要代码修改
-2. **reduce_dims 调参**: 当前 128 维 PCA；64 维可能让 ov_cos 更稳健
-3. **增加 num_queries**: 更多 fine Gaussian (1000→2000) 可能改善场景覆盖
+1. **Phase 3 SelfOccFlow**: 静态时域聚合 — 多帧 Gaussian 融合
+2. **训练时长扩展**: 10K Gaussians 配合 5000+ 步（需要更长 timeout）
+3. **数据增强**: 不同时域 sweep 配置

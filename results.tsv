@@ -1,0 +1,85 @@
+commit	experiment	depth_0_pct	ov_cos_pct	warp_pct	depth_gt_pct	status	description
+8e47150	ar_mar12_001	-8.5	+7.5	-16.3	-1.9	discard	5-loss baseline: tgate frozen, branch_heads frozen, OV detached in sem losses. Load from fixv23_best.
+8e47150	ar_mar12_002	-3.3	+7.7	-12.6	+3.1	discard	sem_ce=1.0 with detached OV features. Load fixv23_best. Test if detach prevents ov_cos corruption.
+8e47150	ar_mar13_001	-7.6	+3.3	-16.3	-1.4	keep	5-loss baseline + ov_cos weight 1.0→2.0. Test if stronger ov signal fixes regression.
+8e47150	ar_mar13_002	-9.1	+3.4	-16.3	-1.8	keep	ov_cos=2.0 + sem_ce=1.0 detached + sem_text=0.5. Test compound semantic losses on KEEP baseline.
+8e47150	ar_mar13_003	-1.6	+3.8	-12.7	+4.0	keep	Phase 1: dyn_cov=0.5 + dyn_depth=0.5 on top of KEEP config (ov_cos=2.0 + sem_ce + sem_text)
+8e47150	ar_mar13_004	-8.0	+1.8	-16.4	-0.7	keep	Phase 2: branch_cls=0.5 enables hard temporal mask + static-only warp. Full loss config.
+8e47150	ar_mar13_005	+9.6	+2.3	-17.3	+10.8	discard	branch_cls=0.5 only, no dyn losses. Test if branch_cls alone helps.
+8e47150	ar_mar13_006	N/A	N/A	N/A	N/A	discard	branch_cls=1.0 (stronger branch supervision). Full config otherwise.
+8e47150	ar_mar13_007	-3.2	+2.3	-10.0	+2.5	keep	sem_text=0: ablate text contrastive loss from Phase 1 KEEP config.
+8e47150	ar_mar13_008	-8.1	+1.8	-16.4	-1.1	keep	dyn_cov=1.0+dyn_depth=1.0: stronger dynamic coverage losses.
+8e47150	ar_mar13_009	-7.0	-0.4	-16.4	-1.5	keep	ov_cos=3.0: push OV cosine weight higher from best config.
+8e47150	ar_mar15_001	+1.3	-4.6	-12.1	+5.0	discard	ov_cos weight 3.0→5.0 on best config (sem_ce=1.0 detached, sem_text=0, dyn_cov/depth=1.0, branch_cls=0.5)
+8e47150	ar_mar15_002	+0.7	-4.6	-12.1	+4.4	keep	ov_cos=5.0 + depth_gt=0.1 (doubled LiDAR anchor to fix borderline depth_gt regression from 001)
+8e47150	ar_mar15_003	-1.2	-1.5	-12.1	+4.3	keep	ov_cos=5.0 + depth_gt=0.1 + depth_foundation=2.0: recover depth_0 improvement while keeping ov_cos gains
+8e47150	ar_mar15_004	+1.5	-4.3	-12.1	+4.2	keep	ov_mse=5.0 (halved from 10.0) + ov_cos=5.0 + depth_gt=0.1: reduce OV gradient pressure to recover depth_0
+8e47150	ar_mar15_005	+1.7	-3.3	-12.1	+4.1	keep	ov_cos=4.0 + depth_gt=0.1: interpolate between ov_cos=3.0 (good depth) and 5.0 (good ov_cos) to find Pareto optimum
+8e47150	ar_mar15_006	+1.1	-4.3	-12.2	+4.6	keep	ov_cos=5.0 + depth_warping=8.0 + depth_gt=0.1: restore warp dominance to recover depth_0 while keeping strong ov_cos
+8e47150	ar_mar15_007	+0.3	-4.3	-12.1	+4.1	keep	ov_mse=0 ablation: remove constantly-regressing dominant loss (was 10.0) to test if ov_mse has been adversarial
+9f3acd6	ar_mar15_008	+0.0	-1.2	-12.1	+3.9	keep	detach spatial params in ov_cos render: ov_cos only updates OV embeddings not geometry. ov_cos=5.0 + depth_gt=0.1
+62bbe4f	ar_mar15_009	+2.8	-6.4	-12.2	+4.8	keep	ov_cos=5.0 with warmup 0→1 over 33% of steps (1000 steps): let geometry converge first before ramping OV cosine loss
+62bbe4f	ar_mar15_010	+0.8	-5.2	-12.1	+5.2	discard	ov_cos=3.0 + warmup 0.33 + depth_gt=0.1: can warmup push ov_cos IMPROVED while keeping depth_0 IMPROVED?
+62bbe4f	ar_mar15_011	+0.8	-2.9	-12.2	+5.3	discard	reproduce mar13_009: ov_cos=3.0, no warmup, no depth_gt override. Verify depth_0 -7% reproducibility
+6624800	ar_mar15_013	-6.1	-1.4	-16.4	-1.1	keep	max_steps=3000 fix + ov_cos=5.0+warmup=0.33 + depth_gt=0.1: recover depth_0 IMPROVED by reaching true 3000 steps
+6624800	ar_mar15_014	-5.9	-1.9	-16.4	-0.9	keep	ov_cos_warmup=0.5 (longer warmup): depth_0 -5.9% warp -16.4% KEEP. ov_cos -1.9% tantalizingly close to IMPROVED (-2% threshold)
+6624800	ar_mar15_015	-6.0	-2.6	-16.4	-0.9	keep	ov_cos=7.0+warmup=0.5: first 3-metric IMPROVED (depth_0 -6.0% ov_cos -2.6% warp -16.4%). depth_gt barely FLAT at -0.9%
+6624800	ar_mar15_016	-6.0	-2.4	-16.4	-2.0	keep	4/4 IMPROVED: ov_cos=7.0+warmup=0.5+depth_gt=0.2 — depth_0 -6.0% ov_cos -2.4% warp -16.4% depth_gt -2.0%. New high-water mark.
+6624800	ar_mar16_001	-5.6	-2.5	-16.4	-3.4	keep	4/4 IMPROVED again: depth_gt=0.3 solidifies depth_gt to -3.4% (vs -2.0%). depth_0 -5.6% ov_cos -2.5% warp -16.4%.
+6624800	ar_mar16_002	-5.9	-1.8	-16.4	-2.0	keep	depth_foundation=1.5: hurt ov_cos (-1.8% FLAT) by competing through same rendering. depth_0 -5.9% warp -16.4% depth_gt -2.0%. Lesson: keep depth_foundation=1.0
+6624800	ar_mar16_003	-4.5	-3.8	-16.4	-3.7	keep	ov_cos=9.0: 4/4 IMPROVED. ov_cos -3.8% (stronger) but depth_0 weakens to -4.5%. warp -16.4% depth_gt -3.7%. Tradeoff vs ov_cos=7.0.
+6624800	ar_mar16_004	-4.6	-3.0	-16.4	-3.0	keep	ov_cos=8.0: 4/4 IMPROVED. depth_0 -4.6% ov_cos -3.0% warp -16.4% depth_gt -3.0%. Pareto: ov_cos=7.0 still best for depth_0.
+6624800	ar_mar16_005	-6.4	-2.1	-16.5	-3.1	keep	branch_cls=0.5: 4/4 IMPROVED. depth_0 new best -6.4% with all 4 IMPROVED. Phase 2 static-only warp cleanly improves depth_0. ov_cos -2.1% warp -16.5% depth_gt -3.1%.
+6624800	ar_mar16_006	-4.6	-2.2	-16.4	-3.5	keep	depth_warping=7.0: hurt depth_0 (-4.6% vs -6.4%). Warp and warp_loss COMPETE for depth_0. Keep depth_warping=5.0 default.
+6624800	ar_mar16_007	-5.3	-3.1	-16.4	-3.3	keep	ablate dyn_cov/dyn_depth=0: depth_0 -5.3% (worse, confirms dyn losses help depth_0) but ov_cos -3.1% (better, less competition). 4/4 IMPROVED.
+6624800	ar_mar16_008	-5.1	-1.1	-16.4	-3.6	keep	ov_cos=5.0+branch_cls=0.5: ov_cos FLAT (-1.1%), depth_0 -5.1% (worse than ov_cos=7.0!). OV signal helps depth indirectly. Keep ov_cos=7.0.
+6624800	ar_mar16_009	-5.5	-2.0	-16.5	-3.3	keep	branch_cls=1.0: worse than 0.5 — depth_0 -5.5%, ov_cos -2.0% FLAT. branch_cls=0.5 is optimal.
+6624800	ar_mar16_010	-5.9	-2.8	-16.4	-3.2	keep	dyn_cov=0.5,dyn_depth=0.5: 4/4 IMPROVED. ov_cos -2.8% (better) but depth_0 -5.9% (slightly worse vs dyn=1.0). dyn=1.0 still best for depth_0.
+e542f69	ar_mar16_011	-5.1	-12.6	-16.4	-2.1	keep	max_steps=4000: 4/4 IMPROVED. ov_cos -12.6% (6x better — 2000 active steps vs 1500). depth_0 -5.1% warp -16.4% depth_gt -2.1%. New standard!
+e542f69	ar_mar16_012	-5.1	-11.5	-16.4	-2.4	keep	ov_cos=5.0+4000steps: same depth_0 -5.1% as ov_cos=7.0. ov_cos -11.5%. 4000 steps depth_0 convergence plateaus; 3000 steps was better for depth_0.
+e542f69	ar_mar16_014	-5.7	-5.2	-16.4	-3.3	keep	ov_cos=7.0+warmup=0.5+depth_gt=0.3+branch_cls=0.5+dyn=1.0: FIRST RUN with max_epochs=1 (warmup actually active). Hypothesis: proper warmup delays OV competition → better depth_0 convergence
+6624800	ar_mar16_015	-6.4	-10.3	-9.6	-5.8	keep	max_steps=3500+warmup=0.5+max_epochs=1 (FIRST proper warmup): TIMEOUT at ~3000/3500 steps but 4/4 IMPROVED. ov_cos -10.3% new record (vs -5.2% @3000s+warmup). depth_0 -6.4% warp -9.6% depth_gt -5.8%. MORE STEPS + WARMUP = BEST COMBO.
+e542f69	ar_mar16_016	-4.0	-15.6	-16.4	-2.4	keep	max_steps=4000+warmup=0.5+max_epochs=1: extend training further. With warmup, ov_cos gets 2000 active steps. Hypothesis: keeps depth_0 strong while ov_cos improves further.
+e542f69	ar_mar16_017	-4.5	-15.3	-16.4	-2.5	keep	max_steps=4000+warmup=0.7: longer warmup (2800 steps ramp, 1200 active). Hypothesis: more geometry pre-convergence recovers depth_0 while keeping ov_cos IMPROVED.
+e542f69	ar_mar16_018	-5.1	-5.4	-16.4	-3.2	keep	ov_cos=9.0+warmup=0.5+3000steps: push ov_cos weight higher at 3000 steps to improve ov_cos metric while preserving depth_0 convergence window.
+e542f69	ar_mar16_019	-5.1	-5.1	-16.4	-3.3	keep	ov_cos=7.0+warmup=0.3+3000steps: shorter warmup (900 warmup, 2100 active steps). Tests if active-step count is the bottleneck for ov_cos convergence.
+6624800	ar_mar16_020	-4.5	-14.2	-10.4	-3.2	keep	max_steps=5000+warmup=0.5 (TIMEOUT at ~4000 steps): 4/4 IMPROVED. ov_cos -14.2% similar to 4000-step. Diminishing returns beyond 4000 steps; 4000 is optimal step budget.
+e542f69	ar_mar16_021	-3.2	-15.0	-16.4	-4.2	keep	4000steps+warmup=0.5+depth_gt=0.5: increase LiDAR anchor weight to recover depth_gt (-2.4%→?) at 4000 steps while keeping ov_cos strong.
+e542f69	ar_mar16_022	-3.5	-15.9	-16.4	-3.1	keep	4000steps+warmup=0.5+depth_gt=0.4: interpolate between 0.3 (depth_0 -4.0%,depth_gt -2.4%) and 0.5 (depth_0 -3.2%, depth_gt -4.2%) to find Pareto optimum.
+e542f69	ar_mar16_023	-1.7	-12.7	-16.4	-1.4	keep	4000steps+warmup=0.5+lr=1e-4 (halved LR): test if lower LR gives better final convergence quality at 4000 steps vs default 2e-4.
+e542f69	ar_mar16_024	-4.9	-15.6	-16.4	-2.4	keep	ov_mse=0+4000steps+warmup=0.5: ablate dominant-but-regressing ov_mse loss (was 10.0, always +50% REGRESSED). Prior test was 3000s no-warmup. Now test in modern config.
+e542f69	ar_mar16_025	-5.3	-4.6	-16.4	-3.5	keep	ov_mse=0+3000steps+warmup=0.5: test if removing ov_mse recovers depth_0 at 3000 steps (was -5.7%, now hoping for -6%+). ov_cos should stay ~-5%
+e542f69	ar_mar16_026	-3.9	-16.3	-16.4	-2.4	keep	ov_mse=0+ov_cos=9.0+4000steps+warmup=0.5: without ov_mse competing, can higher ov_cos push ov_cos metric further while depth_0 stays strong at -4.9%?
+e542f69	ar_mar16_027	-4.6	-15.6	-16.4	-2.8	keep	ov_mse=0+ov_cos=7.0+depth_gt=0.4+4000steps+warmup=0.5: test depth_gt=0.4 WITHOUT ov_mse (previously depth_gt=0.4 tested with ov_mse=10 gave depth_0 -3.5%). Can ov_mse=0 reduce depth_0 penalty?
+e542f69	ar_mar16_028	-4.8	-16.0	-16.4	-2.3	keep	ov_mse=0+sem_text=0+4000steps+warmup=0.5: ablate flat sem_text loss. Best so far: ar_mar16_024 (depth_0 -4.9%, ov_cos -15.6%). Can removing sem_text help?
+e542f69	ar_mar16_029	-4.5	-15.7	-16.4	-2.3	keep	warp_warmup=0+ov_mse=0+4000steps+warmup=0.5: remove warp warmup to give warp signal full 4000 steps (was 3250 active steps with warmup=0.25). Hypothesis: more warp signal improves depth_0 convergence.
+e542f69	ar_mar16_030	+1.3	-13.0	-16.4	+1.2	keep	CURRICULUM: load from ar_mar16_024 best (4000-step ov_mse=0) then run 4000 more steps. Effectively 8000 total T4 steps. Will depth/ov_cos continue to improve?
+e542f69	ar_mar17_001	-4.9	-15.4	-16.4	-2.8	keep	depth_warping=3.0+ov_mse=0+4000steps+warmup=0.5: reduce dominant warp signal (was 5.0) to see if less geometry over-constraint helps ov_cos or depth_0.
+e542f69	ar_mar17_002	-4.3	-14.6	-16.4	-3.6	keep	depth_warping=3.0+depth_gt=0.4+ov_mse=0+4000steps+warmup=0.5: combine reduced warp (depth_gt -2.8%) with higher depth_gt weight (depth_gt -2.8% more with 0.4?) to get depth_gt -3%+
+e542f69	ar_mar17_003	-4.8	-15.5	-16.4	-2.3	keep	depth_warping=2.0+ov_mse=0+4000steps+warmup=0.5: further reduce warp weight. At 3.0 warp still -16.4%. At 2.0 does it still converge? May free budget for depth_0/ov_cos.
+e542f69	ar_mar17_004	-3.9	-15.3	-16.4	-2.4	keep	depth_warping=3.0+depth_gt=0.35+ov_mse=0+4000steps+warmup=0.5: interpolate depth_gt between 0.3 (-2.8%) and 0.4 (-3.6%) to find Pareto optimum that keeps depth_0 near -4.9%.
+e542f69	ar_mar17_005	-1.6	-17.5	-16.4	-3.5	keep	depth_foundation=0.5+ov_mse=0+4000steps+warmup=0.5: halve pseudo-depth signal. INCREASING to 1.5 hurt ov_cos. Does DECREASING help ov_cos by reducing competition?
+e542f69	ar_mar17_006	-2.7	-16.5	-16.4	-2.6	keep	depth_foundation=0.75+ov_mse=0+4000steps+warmup=0.5: depth_foundation=0.5 gave ov_cos -17.5% but depth_0 FLAT. depth_foundation=1.0 gives depth_0 -4.9%. Find Pareto at 0.75.
+69721f2	ar_mar17_007	-4.6	-2.5	-16.4	-2.6	keep	ov_cos_static_only=True+ov_mse=0+4000steps+warmup=0.5: restrict ov_cos to static Gaussians only (opacities*p_static). Hypothesis: less OV-depth conflict → better depth_0 vs ar_mar16_024 (-4.9%).
+69721f2	ar_mar17_008	-4.5	-14.8	-16.4	-2.1	keep	branch_cls=0+ov_mse=0+4000steps+warmup=0.5: ablate branch_cls at 4000 steps. Without it, warp uses all Gaussians (not static-only). Compare vs ar_mar16_024 (branch_cls=0.5, depth_0 -4.9%).
+ac9e103	ar_mar17_009	-4.5	-15.9	-16.4	-2.7	keep	ov_reduce_dims=64 (half of default 128)+ov_mse=0+4000steps+warmup=0.5: fewer PCA dims → more robust cosine similarity. Hypothesis: helps ov_cos without hurting depth_0.
+ac9e103	ar_mar17_010	-4.4	-15.5	-16.4	-2.7	keep	ov_reduce_dims=96+ov_mse=0+4000steps+warmup=0.5: interpolate between 64 (ov_cos -15.9%, depth_0 -4.5%) and 128 (ov_cos -15.6%, depth_0 -4.9%). Find optimal PCA dim.
+fee100c	ar_mar17_011	-4.6	-15.8	-16.4	-3.2	keep	num_queries=[4000,1000,2000] (fine level 1000→2000)+ov_mse=0+4000steps+warmup=0.5: more fine Gaussians for better scene coverage. query_embeds reinit from random.
+fee100c	ar_mar17_012	-5.2	-15.6	-16.4	-3.2	keep	num_queries=[4000,2000,2000]+ov_mse=0+4000steps+warmup=0.5: double both medium and fine queries (was 1000 each). ar_mar17_011 showed fine 1000→2000 gave depth_gt -3.2% (up from -2.4%). Push further?
+fee100c	ar_mar17_013	-5.6	-16.6	-16.4	-3.4	keep	num_queries=[4000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: push fine to 4000 (from 2000). [4000,2000,2000] gave depth_0 -5.2% depth_gt -3.2%. More fine → even better?
+fee100c	ar_mar17_014	-4.8	-16.9	-16.4	-3.2	keep	num_queries=[4000,4000,4000]+ov_mse=0+4000steps+warmup=0.5: 12K total Gaussians (2x baseline). [4000,2000,4000] gave depth_0 -5.6%, ov_cos -16.6%, depth_gt -3.4%. More Gaussians → even better?
+fee100c	ar_mar17_015	-5.2	-14.0	-14.4	-1.3	discard	num_queries=[4000,2000,6000]+ov_mse=0+4000steps (TIMEOUT partial): fine=6000 too slow, depth_gt FLAT -1.3%. More Gaussians need more training time.
+fee100c	ar_mar17_016	-5.3	-15.3	-16.5	-4.8	keep	num_queries=[4000,2000,4000]+depth_gt=0.4+ov_mse=0+4000steps+warmup=0.5: combine best queries with higher LiDAR weight. depth_gt -4.8% (new record!), depth_0 -5.3%, ov_cos -15.3%. More Gaussians handle higher depth_gt weight.
+fee100c	ar_mar17_017	-4.1	-16.2	-16.4	-5.8	keep	num_queries=[4000,2000,4000]+depth_gt=0.5+ov_mse=0+4000steps+warmup=0.5: push depth_gt weight to 0.5. depth_gt=0.4 gave -4.8%.
+fee100c	ar_mar17_018	-4.3	-14.8	-16.4	-6.5	keep	num_queries=[4000,2000,4000]+depth_gt=0.6+ov_mse=0+4000steps+warmup=0.5: push depth_gt further. 0.5 gave -5.8%. Saturating?
+fee100c	ar_mar17_019	-3.8	-13.9	-16.4	-7.7	keep	num_queries=[4000,2000,4000]+depth_gt=0.8+ov_mse=0+4000steps+warmup=0.5: aggressive LiDAR. 0.6 gave depth_gt -6.5%. Where does depth_0 break?
+fee100c	ar_mar17_020	-4.6	-13.9	-16.4	-10.3	keep	num_queries=[4000,2000,4000]+depth_gt=1.0+ov_mse=0+4000steps+warmup=0.5: max LiDAR weight. 0.8 gave -7.7%. How far can we push?
+fee100c	ar_mar17_021	-4.8	-11.9	-16.4	-12.6	keep	num_queries=[4000,2000,4000]+depth_gt=1.5+ov_mse=0+4000steps+warmup=0.5: find breaking point. 1.0 gave depth_gt -10.3% with depth_0 -4.6%. Does 1.5 still work?
+fee100c	ar_mar17_022	-5.9	-10.2	-16.4	-15.5	keep	num_queries=[4000,2000,4000]+depth_gt=2.0+ov_mse=0+4000steps+warmup=0.5: extreme LiDAR. 1.5 gave -12.6%. ov_cos weakening to -11.9%. Does 2.0 break ov_cos IMPROVED?
+fee100c	ar_mar17_023	-4.5	-17.5	-16.5	-2.5	keep	ov_cos=9.0+num_queries=[4000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: higher ov_cos with 10K Gaussians. With 6K, ov_cos=9 hurt depth_0 (-3.9% vs -4.9%). Does 10K handle it better?
+fee100c	ar_mar17_024	-5.2	-15.4	-16.4	-3.2	keep	dyn_cov=2.0+dyn_depth=2.0+num_queries=[4000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: stronger dynamic supervision. 10K Gaussians have more capacity for dynamic objects.
+fee100c	ar_mar17_025	-5.1	-16.4	-16.5	-3.2	keep	depth_warping=3.0+num_queries=[4000,2000,4000]+ov_mse=0+depth_gt=0.3+4000steps+warmup=0.5: reduce warp weight with 10K Gaussians. With 6K, this marginally helped depth_gt.
+fee100c	ar_mar17_026	-5.9	-6.9	-16.4	-4.6	keep	3000steps+ov_mse=10+num_queries=[4000,2000,4000]+warmup=0.5: 3000 steps with ov_mse=10 (beneficial at 3000 steps) and 10K Gaussians. Does 10K help depth_0 at shorter training?
+fee100c	ar_mar17_027	-5.5	-16.7	-16.4	-3.3	keep	ov_mse=5.0+num_queries=[4000,2000,4000]+ov_cos=7.0+depth_gt=0.3+4000steps+warmup=0.5: intermediate ov_mse (vs 0.0 and 10.0). Hypothesis: moderate ov_mse helps early convergence with 10K Gaussians.
+fee100c	ar_mar17_028	-5.6	-17.0	-16.5	-3.3	keep	branch_cls=1.0+num_queries=[4000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: stronger branch supervision with 10K Gaussians. With 6K, 1.0 was worse than 0.5.
+fee100c	ar_mar17_029	-4.9	-16.7	-16.5	-3.1	keep	ov_cos=8.0+num_queries=[4000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: interpolate between ov_cos=7.0 (depth_0 -5.6%) and 9.0 (ov_cos -17.5%). Find Pareto optimum.
