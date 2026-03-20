@@ -102,3 +102,7 @@ a4116a1	ar_mar19_016	-7.3	-18.8	-16.4	-4.0	keep	num_queries=[8000,2000,4000]+dep
 a4116a1	ar_mar19_017	-6.2	-18.0	-16.5	-4.5	keep	num_queries=[8000,2000,4000]+depth_foundation=1.2+depth_gt=0.5: push depth_gt further. 0.4 gave depth_gt=1.7372. Does 0.5 continue improving?
 a4116a1	ar_mar19_018	-5.3	-19.4	-15.7	-0.9	keep	num_queries=[8000,4000,4000] (16K): with 8K coarse as foundation, test if 4K medium (vs 2K) now works. Previously [4000,4000,4000] was worse than [4000,2000,4000].
 a4116a1	ar_mar19_019	-6.9	-19.5	-16.5	-3.0	keep	num_queries=[8000,2000,8000] (18K): push fine to 8K while keeping winning 8K coarse + 2K medium. More fine detail at 18K total.
+db054fb	ar_mar19_020	-6.8	-19.0	-16.5	-2.6	keep	TEMPORAL OV CONSISTENCY (ov_warp_cos=1.0)+[8000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: Phase 3 SelfOccFlow — OV features warped to past frames for temporal consistency. First test!
+db054fb	ar_mar19_021	-7.0	-18.0	-16.5	-3.2	keep	ov_warp_cos=3.0+[8000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: stronger temporal OV weight. 1.0 was neutral. Does 3.0 provide meaningful signal?
+db054fb	ar_mar19_022	-7.1	-17.0	-16.5	-3.5	keep	ov_warp_cos=5.0+[8000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: stronger temporal OV. 3.0 gave depth_0=0.4361 (better), ov_cos=0.0556 (slightly worse). Does 5.0 continue the trend?
+db054fb	ar_mar19_023	-7.4	-17.9	-16.5	-2.9	keep	ov_warp_cos=3.0+depth_foundation=1.2+[8000,2000,4000]+ov_mse=0: combine temporal OV (depth_0 booster) with stronger pseudo-depth. Maximum depth_0 config.
