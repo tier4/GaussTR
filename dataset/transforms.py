@@ -471,6 +471,42 @@ class LoadFeatMaps:
         return results
 
 
+class LoadSweepFeatMaps:
+    """Load DINOv3CLIP features for temporal warp sweep frames.
+
+    Uses warp_img_paths stored by LoadMultiSweepImages to load OV features
+    for past frames. These are used for temporal OV consistency loss.
+    """
+
+    def __init__(self, data_root: str, key: str = 'warp_feats'):
+        self.data_root = data_root
+        self.key = key
+
+    def __call__(self, results: Dict) -> Dict:
+        warp_paths = results.get('warp_img_paths', [])
+        if not warp_paths:
+            return results
+
+        feats = []
+        for img_path in warp_paths:
+            basename = os.path.basename(img_path).split('.')[0]
+            cam_name = os.path.basename(os.path.dirname(img_path))
+            chunk_name = _extract_chunk_name(img_path)
+            feat_path = os.path.join(self.data_root, chunk_name, cam_name, basename + '.npy')
+
+            if os.path.exists(feat_path):
+                feat = np.load(feat_path)
+                if feat.dtype == np.int8:
+                    feat = feat.astype(np.float32) / 127.0
+                feats.append(torch.from_numpy(feat))
+            else:
+                # Fallback: zero features if file missing
+                feats.append(torch.zeros(768, 56, 87, dtype=torch.float32))
+
+        results[self.key] = torch.stack(feats)  # [P*N, C, Hf, Wf]
+        return results
+
+
 class LoadOccFromFile:
     """Load occupancy ground truth from file."""
 
@@ -803,6 +839,7 @@ class LoadMultiSweepImages:
 
         # Load sweep images and compute transforms.
         sweep_imgs = []
+        sweep_img_paths = []  # Track image paths for OV feature loading
         t0_2_x_geo = []
 
         for sweep_idx in sweep_indices:
@@ -818,6 +855,7 @@ class LoadMultiSweepImages:
                 img_path = s_cam['img_path']
                 if not os.path.isabs(img_path) and self.data_root:
                     img_path = os.path.join(self.data_root, img_path)
+                sweep_img_paths.append(img_path)
                 img = cv2.imread(img_path)
                 if img is not None:
                     if self.to_rgb:
@@ -861,10 +899,12 @@ class LoadMultiSweepImages:
         # for 10Hz data to match the ~0.5s baseline of nuScenes 2Hz).
         warp_imgs = []
         warp_t0_2_x = []
+        warp_img_paths = []  # For loading past-frame OV features
         for wi in self.warp_sweep_indices:
             wi_clamped = min(wi, self.num_sweeps - 1)
             warp_imgs.extend(sweep_imgs[wi_clamped * N : (wi_clamped + 1) * N])
             warp_t0_2_x.extend(t0_2_x_geo[wi_clamped * N : (wi_clamped + 1) * N])
+            warp_img_paths.extend(sweep_img_paths[wi_clamped * N : (wi_clamped + 1) * N])
 
         render_gt_imgs = []
         for img in list(results['img'][:N]) + warp_imgs:
@@ -881,6 +921,7 @@ class LoadMultiSweepImages:
         results['t0_2_x_geo'] = np.stack(warp_t0_2_x)
         results['render_gt'] = np.stack(render_gt_imgs)
         results['cam2ego'] = cur_cam2ego  # [N, 4, 4] current frame only
+        results['warp_img_paths'] = warp_img_paths  # For loading past-frame OV features
 
         return results
 
@@ -1044,6 +1085,10 @@ class PackPGOccInputs:
                 gt_depth, (self.render_h, self.render_w))  # [N, 1, Rh, Rw]
             packed['gt_depth'] = gt_depth
 
+        # Past-frame OV features for temporal consistency loss
+        if 'warp_feats' in results:
+            packed['warp_text_vision'] = results['warp_feats']  # [P*N, C, Hf, Wf]
+
         for key in ['token', 'scene_token', 'timestamp', 'sample_idx']:
             if key in results:
                 packed[key] = results[key]
@@ -1079,6 +1124,7 @@ def get_pgocc_train_transforms(
         LoadFeatMaps(
             data_root=feats_root, key='feats', apply_aug=False,
             use_chunk_subdirs=True),
+        LoadSweepFeatMaps(data_root=feats_root, key='warp_feats'),
     ]
 
     if sam3_root:

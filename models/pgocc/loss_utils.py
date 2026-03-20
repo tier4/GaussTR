@@ -277,3 +277,90 @@ def calc_time_warping_loss(depths, t0_2_tn, render_gt, backproject_depth, projec
     if return_diagnostics:
         return loss, diag
     return loss
+
+
+def calc_temporal_ov_consistency_loss(
+    depths, t0_2_tn, ov_feature_t0, ov_feature_tn,
+    backproject_depth, project_3d, k,
+    num_cams=5, valid_row=0, min_translation=0.5, pixel_mask=None,
+):
+    """Temporal OV feature consistency loss.
+
+    Projects current-frame depth to past camera views and computes cosine
+    similarity between current rendered OV features and past-frame DINOv3CLIP
+    features at the projected locations.
+
+    Args:
+        depths: Current-frame depth [N, H, W] or [N, 1, H, W].
+        t0_2_tn: Ego transforms [B, P*N, 4, 4].
+        ov_feature_t0: Current rendered OV features [N, Rh, Rw, D].
+        ov_feature_tn: Past-frame OV features [P*N, D, Rh, Rw] (PCA-projected,
+            resized to render resolution).
+        backproject_depth, project_3d: Projection modules.
+        k: Camera intrinsics [N, 4, 4].
+        num_cams: Number of cameras.
+        valid_row: First row with backbone coverage.
+        min_translation: Skip stationary frames.
+        pixel_mask: Optional [N, 1, H, W] valid pixel mask.
+
+    Returns:
+        Scalar temporal OV consistency loss (1 - cosine_similarity).
+    """
+    k = k[0:num_cams].float()
+    inv_k = torch.inverse(k).float()
+
+    depths = depths.float()
+    cam_points = backproject_depth(depths, inv_k)
+
+    num_past_frames = ov_feature_tn.shape[0] // num_cams
+    cos_losses = []
+
+    for past_i in range(num_past_frames):
+        T_slice = t0_2_tn[0][num_cams * past_i:num_cams * (past_i + 1)].float()
+
+        avg_translation = T_slice[:, :3, 3].norm(dim=1).mean()
+        if avg_translation < min_translation:
+            continue
+
+        pix_coords, _ = project_3d(cam_points, k, T_slice)
+
+        # Sample past-frame OV features at projected coordinates
+        past_ov = ov_feature_tn[past_i * num_cams:(past_i + 1) * num_cams]  # [N, D, Rh, Rw]
+        warped_past_ov = F.grid_sample(
+            past_ov, pix_coords,
+            padding_mode="border", align_corners=True)  # [N, D, Rh, Rw]
+
+        # Mask out-of-bounds projections
+        oob = (pix_coords[..., 0].abs() > 1.0) | (pix_coords[..., 1].abs() > 1.0)
+
+        # Cosine similarity: [N, Rh, Rw]
+        cur_ov = ov_feature_t0.permute(0, 3, 1, 2)  # [N, D, Rh, Rw]
+        cos_sim = F.cosine_similarity(cur_ov, warped_past_ov, dim=1)  # [N, Rh, Rw]
+        cos_loss = 1.0 - cos_sim  # [N, Rh, Rw]
+
+        # Zero out-of-bounds pixels (no gradient)
+        cos_loss = cos_loss.masked_fill(oob, 0.0)
+
+        cos_losses.append(cos_loss)
+
+    if len(cos_losses) == 0:
+        return torch.tensor(0.0, device=depths.device, requires_grad=True)
+
+    cos_losses = torch.cat(cos_losses, dim=0)  # [P*N, Rh, Rw]
+
+    # Apply valid_row mask
+    if valid_row > 0:
+        cos_losses = cos_losses[:, valid_row:, :]
+
+    # Apply pixel mask
+    if pixel_mask is not None:
+        pm = pixel_mask[:num_cams].squeeze(1).float()
+        if valid_row > 0:
+            pm = pm[:, valid_row:, :]
+        if cos_losses.shape[0] > pm.shape[0]:
+            num_past = cos_losses.shape[0] // pm.shape[0]
+            pm = pm.repeat(num_past, 1, 1)
+        count = pm.sum().clamp(min=1.0)
+        return (cos_losses * pm).sum() / count
+
+    return cos_losses.mean()

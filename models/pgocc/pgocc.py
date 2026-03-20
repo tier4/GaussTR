@@ -20,7 +20,7 @@ from .fpn import FPN
 from .gaussian_prediction import GaussianPrediction
 from .sparse_gaussians_decoder import SparseGaussiansDecoder
 from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss, get_gt_loss
-from .loss_utils import BackprojectDepth, Project3D, calc_time_warping_loss
+from .loss_utils import BackprojectDepth, Project3D, calc_time_warping_loss, calc_temporal_ov_consistency_loss
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
 
@@ -522,6 +522,23 @@ class PGOccLightning(pl.LightningModule):
             B, N_cam, D, self.render_conf['render_h'], self.render_conf['render_w'])
         ov_tgt_feature = ov_tgt_feature.permute(0, 1, 3, 4, 2)  # [B, N, Rh, Rw, D]
 
+        # Prepare past-frame OV features for temporal consistency loss
+        warp_ov_feature = None
+        if 'warp_text_vision' in batch and self.loss_weights.get('ov_warp_cos', 0) > 0:
+            warp_ov = batch['warp_text_vision'].to(self.device)  # [B, P*N, C, Hf, Wf]
+            if warp_ov.dim() == 5:
+                warp_ov = warp_ov[0]  # Remove batch dim → [P*N, C, Hf, Wf]
+            PN, C_ov, Hf, Wf = warp_ov.shape
+            # PCA project: [P*N, Hf, Wf, C] @ [C, D] -> [P*N, Hf, Wf, D]
+            warp_ov_flat = warp_ov.permute(0, 2, 3, 1).float()  # [P*N, Hf, Wf, C]
+            warp_ov_pca = warp_ov_flat @ pca_v.to(warp_ov_flat)  # [P*N, Hf, Wf, D]
+            # Resize to render resolution: [P*N, D, Hf, Wf] -> [P*N, D, Rh, Rw]
+            warp_ov_pca = warp_ov_pca.permute(0, 3, 1, 2)  # [P*N, D, Hf, Wf]
+            warp_ov_feature = F.interpolate(
+                warp_ov_pca,
+                size=(self.render_conf['render_h'], self.render_conf['render_w']),
+                mode='bilinear', align_corners=False)  # [P*N, D, Rh, Rw]
+
         # Compute losses per Gaussian level
         total_loss = torch.tensor(0.0, device=self.device)
         loss_dict = {}
@@ -693,6 +710,21 @@ class PGOccLightning(pl.LightningModule):
                 loss_ov_cos = 1.0 - (cos_sim * cos_mask_flat).sum() / cos_count
                 loss_dict[f'ov_cos_{i}'] = loss_ov_cos.item()
                 total_loss = total_loss + loss_ov_cos * self.loss_weights['ov_cos'] * ov_cos_factor
+
+            # Temporal OV consistency loss: compare rendered OV features against
+            # past-frame DINOv3CLIP features warped via depth projection.
+            if (warp_ov_feature is not None and gaussian.ovs is not None
+                    and self.loss_weights.get('ov_warp_cos', 0) > 0):
+                ov_feat_t0 = ov_feature.squeeze(0)  # [N, Rh, Rw, D]
+                loss_ov_warp = calc_temporal_ov_consistency_loss(
+                    warp_depth[0:self.num_cams],
+                    batch['t0_2_x_geo'], ov_feat_t0, warp_ov_feature,
+                    self.backproject_depth, self.project_3d, K,
+                    num_cams=self.num_cams, valid_row=valid_row,
+                    pixel_mask=warp_pixel_mask,
+                )
+                loss_dict[f'ov_warp_cos_{i}'] = loss_ov_warp.item()
+                total_loss = total_loss + loss_ov_warp * self.loss_weights['ov_warp_cos'] * ov_cos_factor
 
             # SAM3 semantic classification loss via class_head MLP (ported from GaussTR)
             # The MLP absorbs classification gradient — features stay aligned with DINOv3CLIP.
