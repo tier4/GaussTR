@@ -438,8 +438,50 @@ ov_cos=7.0 提供最好的绝对 depth_0 质量，ov_cos 差异很小。
 
 5000步+10K Gaussians: warp +10.9% REGRESSED (首次!)。depth_0 Seg5=0.4954 (最优) 但以牺牲时域一致性为代价。4500步: warp FLAT +3.2%。4000步是所有4指标 IMPROVED 的甜蜜点。
 
+### 关键发现 7: 粗 Gaussian 数量是最有影响力的单一超参数
+
+| 配置 | 总量 | depth_0 (Seg5) | ov_cos (Seg5) | depth_gt (Seg5) |
+|------|------|----------------|---------------|-----------------|
+| [4000,2000,4000] | 10K | 0.5101 | 0.0601 | 1.7756 |
+| [6000,2000,4000] | 12K | 0.4660 | 0.0562 | 1.7703 |
+| **[8000,2000,4000]** | **14K** | **0.4386** | **0.0537** | **1.7654** |
+| [10000,2000,4000] | 16K | 0.4244 | 0.0525 | 1.8001 ↓ |
+
+**原理**: 粗级别提供场景骨架 — 更多粗 Gaussian 意味着更密的全局覆盖，后续 medium/fine 级别在更好的基础上精炼。
+**瓶颈**: 超过 8K 粗 Gaussian 时，稀疏 LiDAR (depth_gt=0.3) 无法约束 16K+ 总 Gaussian，depth_gt 开始退化。
+**对比**: 增加 medium ([4000,4000,4000]) 反而更差；增加 coarse 是关键。
+
+### 关键发现 8: depth_foundation=1.2 + depth_gt=0.4 的组合改善
+
+| depth_foundation | depth_gt | depth_0 (Seg5) | ov_cos (Seg5) | depth_gt (Seg5) |
+|-----------------|----------|----------------|---------------|-----------------|
+| 1.0 | 0.3 | 0.5101 | 0.0601 | 1.7756 |
+| 1.2 | 0.4 | 0.5085 ↑ | 0.0611 ↓ | 1.7459 ↑ |
+
+depth_foundation=1.2 + depth_gt=0.4 同时改善 depth_0 和 depth_gt，仅牺牲微小 ov_cos。
+但此测试在 [4000,2000,4000] 下进行。需要在 [8000,2000,4000] 下重新测试。
+
+### 当前最优配置 (ar_mar19_014)
+
+| 参数 | 值 |
+|------|-----|
+| `num_queries` | **[8000,2000,4000]** (14K 总) |
+| `max_steps` | 4000 |
+| `max_epochs` | 1 |
+| `ov_mse` | 0.0 |
+| `ov_cos` | 7.0 |
+| `depth_gt` | 0.3 |
+| `depth_foundation` | 1.0 |
+| `depth_warping` | 5.0 |
+| `dyn_cov/dyn_depth` | 1.0 |
+| `branch_cls` | 0.5 |
+| `ov_cos_warmup_epochs` | 0.5 |
+
+**绝对 Seg5 质量**: depth_0=**0.4386**, ov_cos=**0.0537**, warp=0.1344, depth_gt=1.7654
+
 ### 下一步方向
 
-1. **Phase 3 SelfOccFlow**: 静态时域聚合 — 需要数据管线加载过去帧 OV 特征
-2. **完整梯度累积实验**: timeout=12000s 完成 accumulate=2, max_steps=4000
-3. **数据增强**: 不同时域 sweep 配置
+1. **在 [8000,2000,4000] 下重测**: depth_foundation=1.2+depth_gt=0.4 组合
+2. **在 [8000,2000,4000] 下测试**: depth_gt=0.5 提升 depth_gt 绝对质量
+3. **Phase 3 SelfOccFlow**: 静态时域聚合
+4. **更长训练**: accumulate_grad_batches=2 + 更长 timeout
