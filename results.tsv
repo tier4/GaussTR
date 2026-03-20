@@ -98,3 +98,7 @@ cadcbf5	ar_mar19_006	-8.3	-18.4	-9.7	-11.4	keep	accumulate_grad_batches=2+max_st
 5200def	ar_mar19_013	-5.9	-17.8	-16.4	-3.5	keep	num_queries=[6000,2000,4000]+ov_mse=0+depth_gt=0.3+4000steps+warmup=0.5: increase coarse from 4000 to 6000 (12K total). More coarse coverage. Extra 2000 coarse queries random init.
 5200def	ar_mar19_014	-6.4	-19.0	-16.5	-2.8	keep	num_queries=[8000,2000,4000]+ov_mse=0+depth_gt=0.3+4000steps+warmup=0.5: coarse 6K→8K. [6000,2000,4000] gave depth_0=0.4660, ov_cos=0.0562 (BEST). More coarse = even better?
 5200def	ar_mar19_015	-6.0	-19.9	-15.7	-1.6	keep	num_queries=[10000,2000,4000] (16K total): timeout at 100min. Coarse scaling: 4K→0.5101, 6K→0.4660, 8K→0.4386. Does 10K continue the trend?
+a4116a1	ar_mar19_016	-7.3	-18.8	-16.4	-4.0	keep	num_queries=[8000,2000,4000]+depth_foundation=1.2+depth_gt=0.4: combine best num_queries with improved depth weights. Expecting depth_0<0.44 + depth_gt<1.76.
+a4116a1	ar_mar19_017	-6.2	-18.0	-16.5	-4.5	keep	num_queries=[8000,2000,4000]+depth_foundation=1.2+depth_gt=0.5: push depth_gt further. 0.4 gave depth_gt=1.7372. Does 0.5 continue improving?
+a4116a1	ar_mar19_018	-5.3	-19.4	-15.7	-0.9	keep	num_queries=[8000,4000,4000] (16K): with 8K coarse as foundation, test if 4K medium (vs 2K) now works. Previously [4000,4000,4000] was worse than [4000,2000,4000].
+a4116a1	ar_mar19_019	-6.9	-19.5	-16.5	-3.0	keep	num_queries=[8000,2000,8000] (18K): push fine to 8K while keeping winning 8K coarse + 2K medium. More fine detail at 18K total.
