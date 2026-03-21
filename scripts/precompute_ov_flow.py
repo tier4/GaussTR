@@ -91,7 +91,8 @@ def main():
     args = parser.parse_args()
 
     with open(args.anno_file, 'rb') as f:
-        infos = pickle.load(f)  # noqa: S301 — trusted T4 annotation format
+        data = pickle.load(f)  # noqa: S301 — trusted T4 annotation format
+    infos = data['data_list'] if isinstance(data, dict) and 'data_list' in data else data
 
     total = len(infos)
     chunk_size = (total + args.num_chunks - 1) // args.num_chunks

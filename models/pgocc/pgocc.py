@@ -602,6 +602,19 @@ class PGOccLightning(pl.LightningModule):
             render_depth_ed = render_depth_ed.clamp(min=0.1, max=80.0)
             alpha_mask = (render_alphas > 0.1).detach()
 
+            # Phase 3 (SelfOccFlow): retrieve past-frame static Gaussians from memory bank
+            # and merge with current-frame Gaussians for denser warp depth
+            past_gaussians = None
+            if (self.loss_weights.get('use_memory_bank', False)
+                    and i == 0  # Only merge at coarsest level
+                    and hasattr(self, 'gaussian_memory')):
+                scene_token = batch.get('scene_token', ['unknown'])[0] if 'scene_token' in batch else 'unknown'
+                cam2ego = img_metas[0].get('cam2ego', None)
+                if cam2ego is not None:
+                    ego2global = cam2ego[0] if cam2ego.dim() == 3 else cam2ego
+                    past_gaussians = self.gaussian_memory.retrieve(
+                        ego2global, scene_token, self.device)
+
             # Phase 2 (SelfOccFlow): static-only rendering for warp loss
             # Multiply opacity by p_static so dynamic objects don't contribute to depth warping.
             # This makes warp loss focus on static background, which is consistent across frames.
@@ -639,12 +652,33 @@ class PGOccLightning(pl.LightningModule):
                 warp_depth = motion_render['depth'].permute(0, 3, 1, 2).clamp(min=0.1, max=80.0)
                 warp_alpha_mask = (motion_render['alphas'].permute(0, 3, 1, 2) > 0.1).detach()
             elif use_static_warp:
+                static_means = gaussian.means
+                static_scales = gaussian.scales
+                static_rots = gaussian.rotations
+                static_opacities = gaussian.opacities * gaussian.branch_probs[..., 0].detach()
+                static_ovs = gaussian.ovs
+
+                # Merge past-frame static Gaussians if available
+                if past_gaussians is not None:
+                    B = static_means.shape[0]
+                    pm = past_gaussians['means'].unsqueeze(0)  # [1, M, 3]
+                    ps = past_gaussians['scales'].unsqueeze(0)  # [1, M, 3]
+                    pr = past_gaussians['rotations'].unsqueeze(0)  # [1, M, 4]
+                    po = past_gaussians['opacities'].unsqueeze(0)  # [1, M]
+                    static_means = torch.cat([static_means, pm], dim=1)
+                    static_scales = torch.cat([static_scales, ps], dim=1)
+                    static_rots = torch.cat([static_rots, pr], dim=1)
+                    static_opacities = torch.cat([static_opacities, po], dim=1)
+                    if static_ovs is not None and past_gaussians['ovs'] is not None:
+                        pov = past_gaussians['ovs'].unsqueeze(0)
+                        static_ovs = torch.cat([static_ovs, pov], dim=1)
+
                 static_gaussian = GaussianPrediction(
-                    means=gaussian.means,
-                    scales=gaussian.scales,
-                    rotations=gaussian.rotations,
-                    opacities=gaussian.opacities * gaussian.branch_probs[..., 0].detach(),
-                    ovs=gaussian.ovs,
+                    means=static_means,
+                    scales=static_scales,
+                    rotations=static_rots,
+                    opacities=static_opacities,
+                    ovs=static_ovs,
                 )
                 static_render = batch_splatting_render(
                     static_gaussian, W2C, K, render_conf=self.render_conf, inference=True)
