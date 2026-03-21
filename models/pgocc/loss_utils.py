@@ -366,6 +366,105 @@ def calc_temporal_ov_consistency_loss(
     return cos_losses.mean()
 
 
+def calc_temporal_depth_consistency_loss(
+    depths, t0_2_tn, warp_depth_gt, backproject_depth, project_3d, k,
+    num_cams=5, valid_row=0, min_translation=0.5, pixel_mask=None,
+):
+    """Temporal depth consistency: current Gaussian depth projected to past views
+    should match past-frame foundation depth.
+
+    Unlike the photometric warp loss (which compares rendered images), this
+    directly supervises depth consistency across time — a stronger geometric
+    signal for static scene structure.
+
+    Args:
+        depths: Current-frame rendered depth [N, H, W] or [N, 1, H, W]
+        t0_2_tn: Ego transforms [B, P*N, 4, 4]
+        warp_depth_gt: Past-frame foundation depth [B, P*N, 1, Hd, Wd]
+        backproject_depth, project_3d: Projection modules
+        k: Camera intrinsics [N, 4, 4]
+        num_cams: Number of cameras
+        valid_row: First row with backbone coverage
+        min_translation: Skip stationary frames
+        pixel_mask: Optional [N, 1, H, W] valid pixel mask
+
+    Returns:
+        Scalar depth consistency loss (SiLog-like)
+    """
+    k = k[0:num_cams].float()
+    inv_k = torch.inverse(k).float()
+
+    depths = depths.float()
+    if depths.dim() == 4 and depths.shape[1] == 1:
+        depths = depths.squeeze(1)
+    cam_points = backproject_depth(depths, inv_k)
+
+    # Process past-frame depth target
+    warp_depth = warp_depth_gt[0].float()  # [P*N, ...] (may be 2D or 3D)
+    if warp_depth.dim() == 2:
+        # Single depth map: [H, W] → [1, 1, H, W]
+        warp_depth = warp_depth.unsqueeze(0).unsqueeze(0)
+    elif warp_depth.dim() == 3:
+        # [P*N, H, W] → [P*N, 1, H, W]
+        warp_depth = warp_depth.unsqueeze(1)
+    # Now [P*N, 1, Hd, Wd]
+    Rh, Rw = depths.shape[-2:]
+    # Resize to render resolution
+    warp_depth = F.interpolate(warp_depth, size=(Rh, Rw),
+                                mode='bilinear', align_corners=False)  # [P*N, 1, Rh, Rw]
+
+    num_past_frames = warp_depth.shape[0] // num_cams
+    losses = []
+
+    for past_i in range(num_past_frames):
+        T_slice = t0_2_tn[0][num_cams * past_i:num_cams * (past_i + 1)].float()
+
+        avg_translation = T_slice[:, :3, 3].norm(dim=1).mean()
+        if avg_translation < min_translation:
+            continue
+
+        pix_coords, _ = project_3d(cam_points, k, T_slice)
+
+        # Compute projected depth: transform cam_points to past camera frame
+        P = torch.matmul(k, T_slice)[:, :3, :]  # [N, 3, 4]
+        cam_pts_past = torch.matmul(P, cam_points)  # [N, 3, H*W]
+        proj_depth = cam_pts_past[:, 2, :].reshape(
+            num_cams, Rh, Rw)  # [N, Rh, Rw] depth in past cam frame
+
+        # Sample past-frame depth at projected coordinates
+        past_depth = warp_depth[past_i * num_cams:(past_i + 1) * num_cams]  # [N, 1, Rh, Rw]
+        sampled_depth = F.grid_sample(
+            past_depth, pix_coords,
+            padding_mode="border", align_corners=True).squeeze(1)  # [N, Rh, Rw]
+
+        # Current Gaussian depth projected to past cam frame
+        pred_depth = proj_depth  # [N, Rh, Rw]
+
+        # Mask: valid depth in both views + in-bounds + pixel mask
+        oob = (pix_coords[..., 0].abs() > 1.0) | (pix_coords[..., 1].abs() > 1.0)
+        valid = (sampled_depth > 0.1) & (pred_depth > 0.1) & ~oob
+
+        if valid_row > 0:
+            valid[:, :valid_row, :] = False
+
+        if pixel_mask is not None:
+            pm = pixel_mask[:num_cams].squeeze(1).bool()
+            valid = valid & pm
+
+        if valid.sum() < 100:
+            continue
+
+        # SiLog-like loss (scale-invariant, handles depth range variation)
+        log_diff = torch.log(pred_depth[valid].clamp(min=0.1)) - torch.log(sampled_depth[valid].clamp(min=0.1))
+        loss = torch.sqrt((log_diff ** 2).mean() - 0.5 * (log_diff.mean() ** 2) + 1e-6)
+        losses.append(loss)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=depths.device, requires_grad=True)
+
+    return sum(losses) / len(losses)
+
+
 def calc_dynamic_motion_warp_loss(
     depths, t0_2_tn, render_gt, backproject_depth, project_3d, k,
     dynamic_mask, num_cams=5, valid_row=0, min_translation=0.5,

@@ -21,7 +21,8 @@ from .gaussian_prediction import GaussianPrediction
 from .sparse_gaussians_decoder import SparseGaussiansDecoder
 from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss, get_gt_loss
 from .loss_utils import (BackprojectDepth, Project3D, calc_time_warping_loss,
-                         calc_temporal_ov_consistency_loss, calc_dynamic_motion_warp_loss)
+                         calc_temporal_ov_consistency_loss, calc_dynamic_motion_warp_loss,
+                         calc_temporal_depth_consistency_loss)
 from .bev_flow import compute_motion_flow_loss
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
@@ -695,6 +696,20 @@ class PGOccLightning(pl.LightningModule):
                 loss_warp = loss_warp_result
             loss_dict[f'warp_{i}'] = loss_warp.item()
             total_loss = total_loss + loss_warp * self.loss_weights['depth_warping'] * warp_factor
+
+            # Phase 3: Temporal depth consistency loss
+            # Render current Gaussians from past camera perspectives → compare with past depth
+            if ('warp_depth' in batch
+                    and self.loss_weights.get('temporal_depth', 0) > 0):
+                loss_td = calc_temporal_depth_consistency_loss(
+                    warp_depth[0:self.num_cams],
+                    batch['t0_2_x_geo'], batch['warp_depth'],
+                    self.backproject_depth, self.project_3d, K,
+                    num_cams=self.num_cams, valid_row=valid_row,
+                    pixel_mask=warp_pixel_mask,
+                )
+                loss_dict[f'temporal_depth_{i}'] = loss_td.item()
+                total_loss = total_loss + loss_td * self.loss_weights['temporal_depth'] * warp_factor
 
             # Phase 4: Dynamic motion warp loss (no auto-masking)
             # Directly supervises motion-compensated rendering on dynamic pixels,

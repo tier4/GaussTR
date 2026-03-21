@@ -472,15 +472,18 @@ class LoadFeatMaps:
 
 
 class LoadSweepFeatMaps:
-    """Load DINOv3CLIP features for temporal warp sweep frames.
+    """Load pre-extracted features for temporal warp sweep frames.
 
-    Uses warp_img_paths stored by LoadMultiSweepImages to load OV features
-    for past frames. These are used for temporal OV consistency loss.
+    Uses warp_img_paths stored by LoadMultiSweepImages to load features
+    for past frames. Supports .npy (OV features) and .png (depth maps).
     """
 
-    def __init__(self, data_root: str, key: str = 'warp_feats'):
+    def __init__(self, data_root: str, key: str = 'warp_feats',
+                 png_format: bool = False, depth_scale: float = None):
         self.data_root = data_root
         self.key = key
+        self.png_format = png_format
+        self.depth_scale = depth_scale
 
     def __call__(self, results: Dict) -> Dict:
         warp_paths = results.get('warp_img_paths', [])
@@ -492,16 +495,23 @@ class LoadSweepFeatMaps:
             basename = os.path.basename(img_path).split('.')[0]
             cam_name = os.path.basename(os.path.dirname(img_path))
             chunk_name = _extract_chunk_name(img_path)
-            feat_path = os.path.join(self.data_root, chunk_name, cam_name, basename + '.npy')
 
-            if os.path.exists(feat_path):
-                feat = np.load(feat_path)
-                if feat.dtype == np.int8:
-                    feat = feat.astype(np.float32) / 127.0
-                feats.append(torch.from_numpy(feat))
+            if self.png_format:
+                feat_path = os.path.join(self.data_root, chunk_name, cam_name, basename + '.png')
+                if os.path.exists(feat_path):
+                    feat = _load_png_as_array(feat_path, depth_scale=self.depth_scale)
+                    feats.append(torch.from_numpy(feat))
+                else:
+                    feats.append(torch.zeros(1, 56, 87, dtype=torch.float32))
             else:
-                # Fallback: zero features if file missing
-                feats.append(torch.zeros(768, 56, 87, dtype=torch.float32))
+                feat_path = os.path.join(self.data_root, chunk_name, cam_name, basename + '.npy')
+                if os.path.exists(feat_path):
+                    feat = np.load(feat_path)
+                    if feat.dtype == np.int8:
+                        feat = feat.astype(np.float32) / 127.0
+                    feats.append(torch.from_numpy(feat))
+                else:
+                    feats.append(torch.zeros(768, 56, 87, dtype=torch.float32))
 
         results[self.key] = torch.stack(feats)  # [P*N, C, Hf, Wf]
         return results
@@ -1089,6 +1099,10 @@ class PackPGOccInputs:
         if 'warp_feats' in results:
             packed['warp_text_vision'] = results['warp_feats']  # [P*N, C, Hf, Wf]
 
+        # Past-frame depth for temporal depth consistency loss
+        if 'warp_depth' in results:
+            packed['warp_depth'] = results['warp_depth']  # [P*N, 1, Hd, Wd]
+
         for key in ['token', 'scene_token', 'timestamp', 'sample_idx']:
             if key in results:
                 packed[key] = results[key]
@@ -1125,6 +1139,8 @@ def get_pgocc_train_transforms(
             data_root=feats_root, key='feats', apply_aug=False,
             use_chunk_subdirs=True),
         LoadSweepFeatMaps(data_root=feats_root, key='warp_feats'),
+        LoadSweepFeatMaps(data_root=depth_root, key='warp_depth',
+                          png_format=True, depth_scale=650.0),
     ]
 
     if sam3_root:
