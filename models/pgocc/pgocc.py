@@ -21,6 +21,7 @@ from .gaussian_prediction import GaussianPrediction
 from .sparse_gaussians_decoder import SparseGaussiansDecoder
 from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss, get_gt_loss
 from .loss_utils import BackprojectDepth, Project3D, calc_time_warping_loss, calc_temporal_ov_consistency_loss
+from .bev_flow import compute_motion_flow_loss
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
 
@@ -903,6 +904,33 @@ class PGOccLightning(pl.LightningModule):
             mo = gau_preds[-1].motion_offsets  # [B, Q, 2*P]
             self.log('train/motion_magnitude_mean', mo.abs().mean().item(), sync_dist=True)
             self.log('train/motion_magnitude_max', mo.abs().max().item(), sync_dist=True)
+
+        # === BEV Similarity Flow Loss (Phase 4: SelfOccFlow-inspired) ===
+        # Generates pseudo-flow labels from BEV feature similarity matching,
+        # then supervises the motion head to predict dynamic object motion.
+        finest = gau_preds[-1]
+        if (self.loss_weights.get('motion_flow', 0) > 0
+                and finest.motion_offsets is not None
+                and finest.branch_probs is not None):
+            # Use OV features as the BEV feature representation
+            # (they capture semantic/appearance info needed for matching)
+            if finest.ovs is not None:
+                query_feats_for_bev = finest.ovs.detach()  # [B, Q, C]
+            else:
+                query_feats_for_bev = torch.zeros(
+                    1, finest.means.shape[1], 256, device=self.device)
+
+            loss_motion_flow = compute_motion_flow_loss(
+                finest.motion_offsets,
+                finest.means.detach(),  # Don't let flow loss move Gaussians
+                finest.branch_probs.detach(),
+                query_feats_for_bev,
+                batch['t0_2_x_geo'],
+                pc_range=self.pc_range,
+                num_cams=self.num_cams,
+            )
+            loss_dict['motion_flow'] = loss_motion_flow.item()
+            total_loss = total_loss + loss_motion_flow * self.loss_weights['motion_flow']
 
         # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
         # Encourage Gaussians to cover dynamic object regions instead of ignoring them.
