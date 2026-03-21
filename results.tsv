@@ -107,3 +107,4 @@ db054fb	ar_mar19_021	-7.0	-18.0	-16.5	-3.2	keep	ov_warp_cos=3.0+[8000,2000,4000]
 db054fb	ar_mar19_022	-7.1	-17.0	-16.5	-3.5	keep	ov_warp_cos=5.0+[8000,2000,4000]+ov_mse=0+4000steps+warmup=0.5: stronger temporal OV. 3.0 gave depth_0=0.4361 (better), ov_cos=0.0556 (slightly worse). Does 5.0 continue the trend?
 db054fb	ar_mar19_023	-7.4	-17.9	-16.5	-2.9	keep	ov_warp_cos=3.0+depth_foundation=1.2+[8000,2000,4000]+ov_mse=0: combine temporal OV (depth_0 booster) with stronger pseudo-depth. Maximum depth_0 config.
 bd93a38	ar_mar19_024	-5.4	-18.4	-16.4	-4.1	keep	ov_warp_cos=3.0+depth_gt=0.4+[8000,2000,4000]+ov_mse=0: temporal OV + stronger LiDAR. Without warp, depth_gt=0.4 gave depth_gt=1.7372. With warp, does depth_gt improve further?
+cb8352c	ar_mar19_025	-7.1	-17.4	-16.4	-4.2	keep	ULTIMATE COMBINED: [8000,2000,4000]+depth_foundation=1.2+depth_gt=0.4+ov_warp_cos=3.0+ov_mse=0+warmup=0.5. Combining ALL improvements for maximum overall quality.
