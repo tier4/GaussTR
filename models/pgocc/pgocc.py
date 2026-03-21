@@ -24,6 +24,7 @@ from .loss_utils import (BackprojectDepth, Project3D, calc_time_warping_loss,
                          calc_temporal_ov_consistency_loss, calc_dynamic_motion_warp_loss,
                          calc_temporal_depth_consistency_loss)
 from .bev_flow import compute_motion_flow_loss
+from .gaussian_memory_bank import GaussianMemoryBank
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
 
@@ -130,6 +131,8 @@ class PGOccLightning(pl.LightningModule):
         self.warp_warmup_epochs = warp_warmup_epochs
         self.ov_cos_warmup_epochs = ov_cos_warmup_epochs
         self.ov_cos_static_only = ov_cos_static_only
+        # Phase 3: Gaussian memory bank for static temporal aggregation
+        self.gaussian_memory = GaussianMemoryBank(max_frames=2, static_threshold=0.6)
         self.density_threshold = density_threshold
         self.render_conf = dict(render_h=render_h, render_w=render_w)
         self.img_color_aug = img_color_aug
@@ -1031,6 +1034,22 @@ class PGOccLightning(pl.LightningModule):
             for li, dl in enumerate(self.decoder.decoder_layers):
                 if hasattr(dl, '_last_dynamic_prob_mean') and dl._last_dynamic_prob_mean is not None:
                     self.log(f'train/hard_mask_dyn_prob_L{li}', dl._last_dynamic_prob_mean.item(), sync_dist=True)
+
+        # Phase 3: Push current-frame Gaussians to memory bank for future temporal aggregation
+        if gau_preds and self.loss_weights.get('use_memory_bank', False):
+            finest = gau_preds[-1]
+            # Get ego2global from batch (need per-frame transform)
+            cam2ego = img_metas[0].get('cam2ego', None)
+            scene_token = batch.get('scene_token', ['unknown'])[0] if 'scene_token' in batch else 'unknown'
+            if cam2ego is not None:
+                # cam2ego[0] ≈ ego frame (cam0 to ego is the ego2global for reference cam)
+                ego2global = cam2ego[0] if cam2ego.dim() == 3 else cam2ego
+                self.gaussian_memory.push(
+                    finest.means[0], finest.scales[0], finest.rotations[0],
+                    finest.opacities[0], finest.ovs[0] if finest.ovs is not None else None,
+                    finest.branch_probs[0] if finest.branch_probs is not None else None,
+                    ego2global, scene_token,
+                )
 
         return total_loss
 
