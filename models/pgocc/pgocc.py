@@ -612,8 +612,10 @@ class PGOccLightning(pl.LightningModule):
                 cam2ego = img_metas[0].get('cam2ego', None)
                 if cam2ego is not None:
                     ego2global = cam2ego[0] if cam2ego.dim() == 3 else cam2ego
+                    # Ensure device matches current Gaussians
+                    cur_device = gaussian.means.device
                     past_gaussians = self.gaussian_memory.retrieve(
-                        ego2global, scene_token, self.device)
+                        ego2global.to(cur_device), scene_token, cur_device)
 
             # Phase 2 (SelfOccFlow): static-only rendering for warp loss
             # Multiply opacity by p_static so dynamic objects don't contribute to depth warping.
