@@ -481,7 +481,79 @@ depth_foundation=1.2 + depth_gt=0.4 同时改善 depth_0 和 depth_gt，仅牺�
 
 ### 下一步方向
 
-1. **在 [8000,2000,4000] 下重测**: depth_foundation=1.2+depth_gt=0.4 组合
-2. **在 [8000,2000,4000] 下测试**: depth_gt=0.5 提升 depth_gt 绝对质量
-3. **Phase 3 SelfOccFlow**: 静态时域聚合
-4. **更长训练**: accumulate_grad_batches=2 + 更长 timeout
+### 已完成的下一步
+
+1. ✅ **在 [8000,2000,4000] 下重测**: depth_foundation=1.2+depth_gt=0.4 → depth_0=0.4384, depth_gt=1.7372
+2. ✅ **Coarse scaling**: [10000,2000,4000] + combined → depth_0=0.4196 (best!)
+3. ✅ **Phase 3/4 SelfOccFlow 实现**: 见下文 Section 10
+
+---
+
+## 10. SelfOccFlow Phase 3/4 实现 (Mar21 session)
+
+### 实现 1: Temporal OV Consistency (ov_warp_cos) ✅
+
+**commit** `db054fb`: 将当前帧 OV 特征通过深度投影映射到过去帧，计算余弦相似度。
+**结果**: ov_warp_cos=3.0 给出微小但真实的 depth_0 改善 (0.4386→0.4361)，代价是 ov_cos 退化 (0.0537→0.0556)。
+
+### 实现 2: Motion Head (Phase 4) ✅
+
+**commits**: `cda364f`, `cf1417f`, `b07120b`, `72ffc2b`
+
+实现内容:
+- **motion_head MLP**: 预测 per-query XY 偏移到过去帧
+- **motion-compensated warp**: 动态 Gaussian 位移后渲染，使 warp loss 覆盖动态区域
+- **BEV similarity flow**: 散射动态 Gaussian 到 BEV 网格，余弦匹配生成流伪标签
+- **Dynamic motion warp (无 auto-masking)**: 直接在动态像素上计算 L1 loss，打破鸡蛋问题
+- **Non-detached motion head**: 允许梯度流回 decoder features
+
+**结果**: 所有 motion head 实验（ar_mar21_001-004）都是 **NEUTRAL**。
+
+**根因分析**:
+1. **4000步不够**: per-query 运动回归比二元分类困难得多，需要更长训练
+2. **弱监督信号**: 动态像素占比小(5-15%)，光度信号弱
+3. **鸡蛋问题**: auto-masking 杀死梯度；去掉后 L1 信号仍然太弱
+4. **BEV flow 代理无效**: 用 ego-shifted 当前帧作为过去帧代理无法捕捉真实动态运动
+
+**教训**: per-query 运动偏移需要更强的监督（如预训练光流模型的流标签）或更长训练。
+
+### 实现 3: Temporal Depth Consistency ✅
+
+**commit** `4dceec1`: 投影当前 Gaussian 深度到过去相机视角，与过去帧 foundation depth 比较 (SiLog loss)。
+
+**结果**: depth_gt 从 IMPROVED -4.2% 退化到 FLAT -1.9%。**有害！**
+
+**根因**: Foundation depth (PriorDA) 有噪声。强制 Gaussian 匹配多帧噪声深度放大了噪声。SelfOccFlow 的时域一致性用的是自身预测（自洽），不是外部伪标签。Warp loss 已经提供了自洽的时域信号。
+
+### 实现 4: Gaussian Memory Bank (Phase 3) ✅
+
+**commit** `ba5ea83`: 缓存过去帧 Gaussian 预测，ego-motion 变换后合并到当前帧。
+
+实现内容:
+- FIFO buffer on CPU (最小 GPU 开销)
+- Scene-aware: 不跨场景合并
+- Static-only: 按 branch_probs 过滤
+- Temporal decay: 旧帧贡献衰减
+
+**状态**: 基础设施就绪，retrieve+merge 前的渲染集成尚未测试。
+
+### 当前最优配置 (ar_mar19_026)
+
+| 参数 | 值 |
+|------|-----|
+| `num_queries` | **[10000,2000,4000]** (16K 总) |
+| `depth_foundation` | 1.2 |
+| `depth_gt` | 0.4 |
+| `ov_warp_cos` | 3.0 |
+| `ov_mse` | 0.0 |
+| `ov_cos` | 7.0 |
+| 其他 | dyn=1.0, branch_cls=0.5, warmup=0.5 |
+
+**绝对 Seg5 质量**: depth_0=**0.4196**, ov_cos=**0.0546**, depth_gt=**1.7280**
+
+### 下一步方向
+
+1. **Memory bank merge rendering**: 将过去帧静态 Gaussian 合并到当前渲染中
+2. **光流预计算**: 用 UniMatch/RAFT 预计算 T4 光流，作为 motion head 监督
+3. **更多 decoder layers**: 增加 transformer 层数
+4. **不同 backbone**: ViT-L vs ResNet50
