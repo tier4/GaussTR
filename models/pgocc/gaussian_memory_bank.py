@@ -81,7 +81,7 @@ class GaussianMemoryBank:
         all_opacities = []
         all_ovs = []
 
-        cur_e2g = current_ego2global.float()
+        cur_e2g = current_ego2global.float().to(device)
         cur_g2e = torch.inverse(cur_e2g)  # global → current ego
 
         for idx, frame in enumerate(self.buffer):
@@ -99,12 +99,12 @@ class GaussianMemoryBank:
                 continue
 
             # Transform from past ego → global → current ego
-            past_e2g = frame.ego2global.float()
+            past_e2g = frame.ego2global.float().to(device)
             transform = cur_g2e @ past_e2g  # [4, 4]
 
-            past_means = frame.means[static_mask]  # [K, 3]
+            past_means = frame.means[static_mask].to(device)  # [K, 3]
             # Homogeneous transform
-            ones = torch.ones(past_means.shape[0], 1)
+            ones = torch.ones(past_means.shape[0], 1, device=device)
             past_homo = torch.cat([past_means, ones], dim=1)  # [K, 4]
             cur_means = (transform @ past_homo.T).T[:, :3]  # [K, 3]
 
@@ -113,12 +113,12 @@ class GaussianMemoryBank:
             decay = self.temporal_decay ** dt
 
             all_means.append(cur_means)
-            all_scales.append(frame.scales[static_mask])
-            all_rots.append(frame.rotations[static_mask])
-            all_opacities.append(frame.opacities[static_mask] * decay)
+            all_scales.append(frame.scales[static_mask].to(device))
+            all_rots.append(frame.rotations[static_mask].to(device))
+            all_opacities.append(frame.opacities[static_mask].to(device) * decay)
 
             if frame.ovs is not None:
-                all_ovs.append(frame.ovs[static_mask])
+                all_ovs.append(frame.ovs[static_mask].to(device))
 
         if len(all_means) == 0:
             return None
