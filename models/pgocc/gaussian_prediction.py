@@ -16,3 +16,6 @@ class GaussianPrediction:
     # Phase 2: static/dynamic branching (SelfOccFlow-inspired)
     branch_logits: Optional[torch.Tensor] = None   # [B, Q, 2] raw logits
     branch_probs: Optional[torch.Tensor] = None     # [B, Q, 2] softmax probs
+    # Phase 4: per-query motion offsets for dynamic objects (SelfOccFlow-inspired)
+    # Predicts where each dynamic Gaussian was in past frames (ego-plane XY)
+    motion_offsets: Optional[torch.Tensor] = None   # [B, Q, 2*P] P=num_past_frames, XY per frame

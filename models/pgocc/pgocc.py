@@ -601,7 +601,38 @@ class PGOccLightning(pl.LightningModule):
             # This makes warp loss focus on static background, which is consistent across frames.
             use_static_warp = (self.loss_weights.get('branch_cls', 0) > 0
                                and gaussian.branch_probs is not None)
-            if use_static_warp:
+
+            # Phase 4 (SelfOccFlow): motion-compensated warp
+            # Instead of excluding dynamic objects, shift them by predicted motion offsets
+            # so they align with their past-frame positions. Both static AND dynamic contribute.
+            use_motion_warp = (self.loss_weights.get('motion_warp', 0) > 0
+                               and gaussian.motion_offsets is not None
+                               and gaussian.branch_probs is not None)
+
+            if use_motion_warp:
+                # Build motion-compensated Gaussian set for each past frame
+                # motion_offsets: [B, Q, 2*P] where P = num_past_frames
+                bp = gaussian.branch_probs.detach()
+                p_dyn = bp[..., 1:2]  # [B, Q, 1]
+                p_sta = bp[..., 0:1]  # [B, Q, 1]
+                # For the first past frame, use offsets [:2]
+                # Motion offsets are in ego XY coordinates (meters)
+                motion_xy = gaussian.motion_offsets[..., :2]  # [B, Q, 2]
+                # Shift dynamic Gaussian means by predicted motion
+                means_compensated = gaussian.means.clone()
+                means_compensated[..., :2] = means_compensated[..., :2] + motion_xy * p_dyn
+                motion_gaussian = GaussianPrediction(
+                    means=means_compensated,
+                    scales=gaussian.scales,
+                    rotations=gaussian.rotations,
+                    opacities=gaussian.opacities,  # Full opacity (both static + motion-compensated dynamic)
+                    ovs=gaussian.ovs,
+                )
+                motion_render = batch_splatting_render(
+                    motion_gaussian, W2C, K, render_conf=self.render_conf, inference=True)
+                warp_depth = motion_render['depth'].permute(0, 3, 1, 2).clamp(min=0.1, max=80.0)
+                warp_alpha_mask = (motion_render['alphas'].permute(0, 3, 1, 2) > 0.1).detach()
+            elif use_static_warp:
                 static_gaussian = GaussianPrediction(
                     means=gaussian.means,
                     scales=gaussian.scales,
@@ -866,6 +897,12 @@ class PGOccLightning(pl.LightningModule):
                 if any_visible.sum() > 0:
                     self.log('train/branch_gt_dynamic_frac',
                              gt_dynamic[any_visible].mean().item(), sync_dist=True)
+
+        # Log motion head diagnostics
+        if batch_idx % 100 == 0 and gau_preds[-1].motion_offsets is not None:
+            mo = gau_preds[-1].motion_offsets  # [B, Q, 2*P]
+            self.log('train/motion_magnitude_mean', mo.abs().mean().item(), sync_dist=True)
+            self.log('train/motion_magnitude_max', mo.abs().max().item(), sync_dist=True)
 
         # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
         # Encourage Gaussians to cover dynamic object regions instead of ignoring them.

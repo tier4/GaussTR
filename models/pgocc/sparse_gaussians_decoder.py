@@ -48,10 +48,12 @@ class SparseGaussiansDecoder(nn.Module):
                  restrict_xyz=True,
                  use_anisotropy_encoding=True,
                  scale_range=(0.0, 2.0),
-                 use_hard_mask=True):
+                 use_hard_mask=True,
+                 num_motion_frames=2):
         super().__init__()
         self.scale_range = scale_range
         self.use_hard_mask = use_hard_mask
+        self.num_motion_frames = num_motion_frames
 
         self.embed_dims = embed_dims
         self.num_frames = num_frames
@@ -129,6 +131,18 @@ class SparseGaussiansDecoder(nn.Module):
         if not use_hard_mask:
             for p in self.branch_heads.parameters():
                 p.requires_grad = False
+
+        # Phase 4: motion head — predicts per-query XY offsets to past frames
+        # Only on finest layer. Output: [B, Q, 2*num_motion_frames]
+        # Zero-init output layer so motion starts at zero (no motion = static)
+        self.motion_head = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, 2 * num_motion_frames),
+        )
+        # Zero-init: start with no predicted motion (safe initialization)
+        nn.init.zeros_(self.motion_head[-1].weight)
+        nn.init.zeros_(self.motion_head[-1].bias)
 
     @torch.no_grad()
     def init_weights(self):
@@ -373,6 +387,12 @@ class SparseGaussiansDecoder(nn.Module):
             b_probs = torch.softmax(b_logits, dim=-1)  # [B, Q, 2]
             prev_branch_probs = b_probs  # feed to next layer for temporal masking
 
+            # Phase 4: motion head (finest layer only)
+            # Detach to prevent motion gradients from corrupting shared decoder features
+            motion_offsets = None
+            if i == len(self.layers_scales) - 1:
+                motion_offsets = self.motion_head(query_feat_part.detach())  # [B, Q, 2*P]
+
             pred_gaussians = GaussianPrediction(
                 means=query_coord,
                 scales=merged_scales,
@@ -382,6 +402,7 @@ class SparseGaussiansDecoder(nn.Module):
                 colors=None,
                 branch_logits=b_logits,
                 branch_probs=b_probs,
+                motion_offsets=motion_offsets,
             )
             gau_preds.append(pred_gaussians)
 
