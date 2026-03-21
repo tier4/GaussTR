@@ -388,10 +388,12 @@ class SparseGaussiansDecoder(nn.Module):
             prev_branch_probs = b_probs  # feed to next layer for temporal masking
 
             # Phase 4: motion head (finest layer only)
-            # Detach to prevent motion gradients from corrupting shared decoder features
+            # Non-detached: motion gradient flows to decoder features.
+            # This is necessary because motion regression (continuous 2D offset)
+            # requires richer feature information than binary classification.
             motion_offsets = None
             if i == len(self.layers_scales) - 1:
-                motion_offsets = self.motion_head(query_feat_part.detach())  # [B, Q, 2*P]
+                motion_offsets = self.motion_head(query_feat_part)  # [B, Q, 2*P]
 
             pred_gaussians = GaussianPrediction(
                 means=query_coord,
