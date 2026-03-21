@@ -364,3 +364,79 @@ def calc_temporal_ov_consistency_loss(
         return (cos_losses * pm).sum() / count
 
     return cos_losses.mean()
+
+
+def calc_dynamic_motion_warp_loss(
+    depths, t0_2_tn, render_gt, backproject_depth, project_3d, k,
+    dynamic_mask, num_cams=5, valid_row=0, min_translation=0.5,
+):
+    """Motion-compensated warp loss for dynamic pixels only, WITHOUT auto-masking.
+
+    Unlike the standard warp loss which uses identity auto-masking (which kills
+    gradients for dynamic pixels), this loss directly computes photometric error
+    on dynamic pixels. This provides gradient signal to the motion head even
+    when the predicted motion is initially zero.
+
+    Args:
+        depths: Motion-compensated depth [N, 1, H, W] (dynamic Gaussians shifted)
+        t0_2_tn: Ego transforms [B, P*N, 4, 4]
+        render_gt: GT images [B, T*N, H, W, 3]
+        backproject_depth, project_3d: Projection modules
+        k: Camera intrinsics [N, 4, 4]
+        dynamic_mask: [N, 1, H, W] True = dynamic pixel
+        num_cams: Number of cameras
+        valid_row: First row with backbone coverage
+        min_translation: Skip stationary frames
+
+    Returns:
+        Scalar loss for dynamic motion warp (no auto-masking)
+    """
+    render_gt = render_gt[0].permute(0, 3, 1, 2) / 255.0
+    t0_img = render_gt[0:num_cams]
+    tn_img = render_gt[num_cams:3 * num_cams]
+    k = k[0:num_cams].float()
+    inv_k = torch.inverse(k).float()
+
+    depths = depths.float()
+    if depths.dim() == 4 and depths.shape[1] == 1:
+        depths = depths.squeeze(1)
+    cam_points = backproject_depth(depths, inv_k)
+
+    num_past_frames = int(len(tn_img) / num_cams)
+    losses = []
+
+    for past_i in range(num_past_frames):
+        T_slice = t0_2_tn[0][num_cams * past_i:num_cams * (past_i + 1)].float()
+
+        avg_translation = T_slice[:, :3, 3].norm(dim=1).mean()
+        if avg_translation < min_translation:
+            continue
+
+        pix_coords, _ = project_3d(cam_points, k, T_slice)
+
+        warped_img = F.grid_sample(
+            tn_img[past_i * num_cams:(past_i + 1) * num_cams],
+            pix_coords, padding_mode="border", align_corners=True)
+
+        # L1 loss (no SSIM — simpler and sufficient for motion supervision)
+        l1_loss = torch.abs(warped_img - t0_img)  # [N, 3, H, W]
+
+        # Mask: out-of-bounds + non-dynamic + blind rows
+        oob = (pix_coords[..., 0].abs() > 1.0) | (pix_coords[..., 1].abs() > 1.0)
+        dyn_mask = dynamic_mask[:num_cams].float()  # [N, 1, H, W]
+
+        if valid_row > 0:
+            dyn_mask[:, :, :valid_row, :] = 0
+            l1_loss = l1_loss * dyn_mask
+            l1_loss = l1_loss.masked_fill(oob.unsqueeze(1), 0.0)
+        else:
+            l1_loss = l1_loss * dyn_mask
+            l1_loss = l1_loss.masked_fill(oob.unsqueeze(1), 0.0)
+
+        count = (dyn_mask.sum() * 3).clamp(min=1.0)
+        losses.append(l1_loss.sum() / count)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=depths.device, requires_grad=True)
+
+    return sum(losses) / len(losses)

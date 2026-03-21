@@ -20,7 +20,8 @@ from .fpn import FPN
 from .gaussian_prediction import GaussianPrediction
 from .sparse_gaussians_decoder import SparseGaussiansDecoder
 from .render import batch_splatting_render, prepare_gs_attribute, get_depth_loss, get_gt_loss
-from .loss_utils import BackprojectDepth, Project3D, calc_time_warping_loss, calc_temporal_ov_consistency_loss
+from .loss_utils import (BackprojectDepth, Project3D, calc_time_warping_loss,
+                         calc_temporal_ov_consistency_loss, calc_dynamic_motion_warp_loss)
 from .bev_flow import compute_motion_flow_loss
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
@@ -694,6 +695,22 @@ class PGOccLightning(pl.LightningModule):
                 loss_warp = loss_warp_result
             loss_dict[f'warp_{i}'] = loss_warp.item()
             total_loss = total_loss + loss_warp * self.loss_weights['depth_warping'] * warp_factor
+
+            # Phase 4: Dynamic motion warp loss (no auto-masking)
+            # Directly supervises motion-compensated rendering on dynamic pixels,
+            # providing gradient to the motion head even at zero-initialization.
+            if (use_motion_warp and self.loss_weights.get('dyn_motion_warp', 0) > 0
+                    and sam3_mask is not None):
+                dyn_pixel = ~dynamic_mask & ego_mask  # True = dynamic pixel
+                loss_dyn_warp = calc_dynamic_motion_warp_loss(
+                    warp_depth[0:self.num_cams],
+                    batch['t0_2_x_geo'], batch['render_gt'],
+                    self.backproject_depth, self.project_3d, K,
+                    dynamic_mask=dyn_pixel,
+                    num_cams=self.num_cams, valid_row=valid_row,
+                )
+                loss_dict[f'dyn_motion_warp_{i}'] = loss_dyn_warp.item()
+                total_loss = total_loss + loss_dyn_warp * self.loss_weights['dyn_motion_warp'] * warp_factor
 
             # OV feature losses (masked to backbone-visible region + ego mask)
             if gaussian.ovs is not None:
