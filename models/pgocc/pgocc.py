@@ -199,6 +199,19 @@ class PGOccLightning(pl.LightningModule):
             num_outs=num_levels,
         )
 
+        # === DINOv3CLIP feature injection ===
+        # Project DINOv3CLIP features (768-dim) to embed_dims and fuse with FPN features.
+        # This gives the decoder access to rich semantic information from a much larger ViT model.
+        self.use_dino_injection = use_ov  # Only if OV features are available
+        if self.use_dino_injection:
+            self.dino_projector = nn.Sequential(
+                nn.Conv2d(ov_dim, embed_dims, kernel_size=1),
+                nn.BatchNorm2d(embed_dims),
+                nn.ReLU(inplace=True),
+            )
+            # Learnable fusion weight (starts at 0 for safe initialization)
+            self.dino_fusion_alpha = nn.Parameter(torch.zeros(1))
+
         # === Decoder ===
         self.decoder = SparseGaussiansDecoder(
             embed_dims=embed_dims,
@@ -473,6 +486,39 @@ class PGOccLightning(pl.LightningModule):
 
         return out
 
+    def _inject_dino_features(self, mlvl_feats, dino_feats):
+        """Fuse DINOv3CLIP features into FPN level 0 (highest resolution).
+
+        Args:
+            mlvl_feats: List of [B, TN, C, Hi, Wi] FPN features
+            dino_feats: [B, N, C_dino, Hf, Wf] DINOv3CLIP features (current frame only)
+        """
+        if not self.use_dino_injection or dino_feats is None:
+            return mlvl_feats
+
+        B, TN, C, H0, W0 = mlvl_feats[0].shape
+        N = dino_feats.shape[1]
+
+        # Project DINOv3CLIP: [B*N, C_dino, Hf, Wf] -> [B*N, C, Hf, Wf]
+        dino = dino_feats.reshape(B * N, *dino_feats.shape[2:])
+        dino_proj = self.dino_projector(dino)  # [B*N, C, Hf, Wf]
+
+        # Resize to match FPN level 0
+        dino_proj = F.interpolate(dino_proj, size=(H0, W0), mode='bilinear', align_corners=False)
+
+        # Fusion weight (sigmoid of learnable parameter, starts near 0)
+        alpha = torch.sigmoid(self.dino_fusion_alpha)
+
+        # Apply to current-frame cameras only (first N of TN channels)
+        fpn0 = mlvl_feats[0].reshape(B * TN, C, H0, W0)
+        # Create a full-size dino tensor (zeros for sweep frames)
+        dino_full = torch.zeros_like(fpn0)
+        dino_full[:B * N] = dino_proj  # Only current-frame cameras get DINO injection
+        fpn0 = fpn0 + alpha * dino_full
+        mlvl_feats[0] = fpn0.reshape(B, TN, C, H0, W0)
+
+        return mlvl_feats
+
     def forward(self, batch):
         """Forward pass for training or inference."""
         img = batch['img']
@@ -480,6 +526,13 @@ class PGOccLightning(pl.LightningModule):
         depth = batch.get('depth')
 
         mlvl_feats = self.extract_feat(img, img_metas)
+
+        # Inject DINOv3CLIP features into FPN output
+        dino_feats = batch.get('text_vision')
+        if dino_feats is not None:
+            dino_feats = dino_feats.to(mlvl_feats[0].device)
+        mlvl_feats = self._inject_dino_features(mlvl_feats, dino_feats)
+
         gau_preds = self.decoder(mlvl_feats, img_metas=img_metas, depth=depth)
 
         return gau_preds
