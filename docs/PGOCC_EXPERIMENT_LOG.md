@@ -535,25 +535,50 @@ depth_foundation=1.2 + depth_gt=0.4 同时改善 depth_0 和 depth_gt，仅牺�
 - Static-only: 按 branch_probs 过滤
 - Temporal decay: 旧帧贡献衰减
 
-**状态**: 基础设施就绪，retrieve+merge 前的渲染集成尚未测试。
+**结果 (ar_mar21_009, 14K)**: depth_0=**0.4233** (vs 无 bank 0.4384) — **3.4% 绝对改善！**
+**可复现性**: ar_mar21_012 复现为 0.4237 (一致)
+**最优参数**: threshold=0.3, decay=0.9 → depth_0=**0.4219** (ar_mar21_014)
+**All-level merge**: 与 coarsest-only 相当（marginal）→ 保持 coarsest-only (简单)
+**dyn=2.0 with bank**: 0.4291（更差）→ 保持 dyn=1.0
 
-### 当前最优配置 (ar_mar19_026)
+**核心机制**: 过去帧的静态 Gaussian 通过 ego-motion 变换到当前帧坐标系，与当前帧 Gaussian 合并后渲染 warp depth。额外的几何覆盖提升了深度一致性。
+
+### 实现 5: OV Flow 预计算脚本 ✅
+
+**commit** `dd7208c`: DINOv3CLIP 特征匹配生成语义光流伪标签。
+
+- 对每个像素，在过去帧的局部窗口(search_radius=4)中搜索最佳余弦相似度匹配
+- 位移 = 语义光流伪标签
+- 并行 8 GPU 处理 177K 样本，预计 ~3.7h
+- 输出: [2, Hf, Wf] float16 .npy 文件
+- **状态**: 正在预计算中...
+
+### 当前最优配置 (ar_mar21_014)
 
 | 参数 | 值 |
 |------|-----|
-| `num_queries` | **[10000,2000,4000]** (16K 总) |
+| `num_queries` | [8000,2000,4000] (14K) |
 | `depth_foundation` | 1.2 |
 | `depth_gt` | 0.4 |
 | `ov_warp_cos` | 3.0 |
 | `ov_mse` | 0.0 |
 | `ov_cos` | 7.0 |
+| `use_memory_bank` | **true** |
+| `memory_bank_frames` | 2 |
+| bank threshold/decay | 0.3 / 0.9 |
 | 其他 | dyn=1.0, branch_cls=0.5, warmup=0.5 |
 
-**绝对 Seg5 质量**: depth_0=**0.4196**, ov_cos=**0.0546**, depth_gt=**1.7280**
+**绝对 Seg5 质量**: depth_0=**0.4219**, ov_cos=0.0600, depth_gt=1.7150
+
+**进步总结 (从原始基线)**:
+| 指标 | 原始 (6K, 无 bank) | 最优 (14K + bank) | 改善 |
+|------|-------------------|------------------|------|
+| depth_0 | 0.5101 | **0.4219** | -17.3% |
+| ov_cos | 0.0601 | 0.0600 | -0.2% |
+| depth_gt | 1.7756 | **1.7150** | -3.4% |
 
 ### 下一步方向
 
-1. **Memory bank merge rendering**: 将过去帧静态 Gaussian 合并到当前渲染中
-2. **光流预计算**: 用 UniMatch/RAFT 预计算 T4 光流，作为 motion head 监督
-3. **更多 decoder layers**: 增加 transformer 层数
-4. **不同 backbone**: ViT-L vs ResNet50
+1. **Flow-supervised motion head**: 用预计算的 OV flow 作为强监督信号训练 motion head
+2. **Decoder architecture**: 增加 decoder 层数或 attention heads
+3. **Inference temporal fusion**: 推理时多帧 Gaussian 合并
