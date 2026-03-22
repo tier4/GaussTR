@@ -115,3 +115,4 @@ b07120b	ar_mar21_003	-7.0	-20.0	-16.5	-4.1	keep	DYNAMIC MOTION WARP (no auto-mas
 72ffc2b	ar_mar21_004	-7.3	-18.4	-16.5	-4.7	keep	NON-DETACHED motion head + dyn_motion_warp=2.0: gradient flows to decoder features. Hypothesis: richer features enable motion learning. Watch for depth_0/ov_cos regression from feature corruption.
 4dceec1	ar_mar21_005	-6.6	-17.4	-14.5	-1.9	keep	TEMPORAL DEPTH CONSISTENCY: temporal_depth=1.0+[10K,2K,4K]+all improvements. SiLog loss between projected Gaussian depth and past-frame foundation depth. Direct geometric temporal signal.
 7aeba97	ar_mar21_006	-5.2	-18.9	-15.7	-2.2	keep	BASELINE with latest code: [10K,2K,4K]+df=1.2+dgt=0.4+ov_warp=3.0 (no motion/temporal_depth). Clean reference for SelfOccFlow comparison.
+fd20ac3	ar_mar21_007	-6.7	-17.6	-14.4	-2.6	keep	MEMORY BANK MERGE: past static Gaussians merged with current for denser warp depth. Phase 3 SelfOccFlow — true temporal aggregation with ego-motion transformed past Gaussians.
