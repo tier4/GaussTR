@@ -24,6 +24,7 @@ from .loss_utils import (BackprojectDepth, Project3D, calc_time_warping_loss,
                          calc_temporal_ov_consistency_loss, calc_dynamic_motion_warp_loss,
                          calc_temporal_depth_consistency_loss)
 from .bev_flow import compute_motion_flow_loss
+from .flow_supervision import compute_flow_supervision_loss
 from .gaussian_memory_bank import GaussianMemoryBank
 from .utils import GridMask, GpuPhotoMetricDistortion, pad_multiple, OCC3D_CATEGORIES
 
@@ -1004,6 +1005,28 @@ class PGOccLightning(pl.LightningModule):
             )
             loss_dict['motion_flow'] = loss_motion_flow.item()
             total_loss = total_loss + loss_motion_flow * self.loss_weights['motion_flow']
+
+        # === Flow-supervised motion head (Phase 4 with pre-computed OV flow) ===
+        if (self.loss_weights.get('flow_supervision', 0) > 0
+                and finest.motion_offsets is not None
+                and finest.branch_probs is not None
+                and 'warp_flow' in batch):
+            flow_maps = batch['warp_flow'].to(self.device)
+            if flow_maps.dim() == 5:
+                flow_maps = flow_maps  # [B, P*N, 2, Hf, Wf]
+            loss_flow_sup = compute_flow_supervision_loss(
+                finest.motion_offsets,
+                finest.means.detach(),
+                finest.branch_probs.detach(),
+                flow_maps,
+                W2C, K,
+                pc_range=self.pc_range,
+                num_cams=self.num_cams,
+                render_h=self.render_conf['render_h'],
+                render_w=self.render_conf['render_w'],
+            )
+            loss_dict['flow_supervision'] = loss_flow_sup.item()
+            total_loss = total_loss + loss_flow_sup * self.loss_weights['flow_supervision']
 
         # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
         # Encourage Gaussians to cover dynamic object regions instead of ignoring them.
