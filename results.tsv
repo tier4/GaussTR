@@ -125,3 +125,4 @@ a6da47c	ar_mar21_013	-12.2	-12.1	-9.6	-8.0	keep	MEMORY BANK ALL LEVELS: merge pa
 9f3afca	ar_mar21_014	-12.6	-12.0	-9.6	-7.5	keep	TUNED MEMORY BANK: threshold=0.3 (was 0.6), decay=0.9 (was 0.8). More past Gaussians with higher contribution. ar_mar21_009 baseline: depth_0=0.4233.
 e8f449f	ar_mar21_015	-11.6	-11.4	-9.7	-7.7	keep	MEMORY BANK + dyn=2.0: stronger dynamic losses with bank. Earlier dyn=2.0 hurt at 10K without bank. With bank providing static coverage, can stronger dyn help?
 52a5457	ar_mar21_016	-12.2	-12.7	-9.6	-7.7	keep	MEMORY BANK + ov_cos-optimal config (df=1.0, dgt=0.3): tests if bank helps the original ov_cos-optimal config. Without bank: ar_mar19_014 depth_0=0.4386, ov_cos=0.0537.
+7c3a9ad	ar_mar22_001	-12.5	-12.1	-9.6	-7.4	keep	FLOW-SUPERVISED MOTION HEAD: pre-computed OV flow (1.77M files) + motion_warp + memory bank + all improvements. First test with explicit flow supervision for motion head.
