@@ -133,7 +133,8 @@ class PGOccLightning(pl.LightningModule):
         self.ov_cos_warmup_epochs = ov_cos_warmup_epochs
         self.ov_cos_static_only = ov_cos_static_only
         # Phase 3: Gaussian memory bank for static temporal aggregation
-        self.gaussian_memory = GaussianMemoryBank(max_frames=memory_bank_frames, static_threshold=0.6)
+        self.gaussian_memory = GaussianMemoryBank(
+            max_frames=memory_bank_frames, static_threshold=0.3, temporal_decay=0.9)
         self.density_threshold = density_threshold
         self.render_conf = dict(render_h=render_h, render_w=render_w)
         self.img_color_aug = img_color_aug
