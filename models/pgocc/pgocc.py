@@ -607,6 +607,7 @@ class PGOccLightning(pl.LightningModule):
             # and merge with current-frame Gaussians for denser warp depth
             past_gaussians = None
             if (self.loss_weights.get('use_memory_bank', False)
+                    and i == 0  # Coarsest level only (all-level merge marginal)
                     and hasattr(self, 'gaussian_memory')):
                 scene_token = batch.get('scene_token', ['unknown'])[0] if 'scene_token' in batch else 'unknown'
                 cam2ego = img_metas[0].get('cam2ego', None)
