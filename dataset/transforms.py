@@ -1103,6 +1103,10 @@ class PackPGOccInputs:
         if 'warp_depth' in results:
             packed['warp_depth'] = results['warp_depth']  # [P*N, 1, Hd, Wd]
 
+        # Pre-computed OV flow for motion head supervision
+        if 'warp_flow' in results:
+            packed['warp_flow'] = results['warp_flow']  # [P*N, 2, Hf, Wf]
+
         for key in ['token', 'scene_token', 'timestamp', 'sample_idx']:
             if key in results:
                 packed[key] = results[key]
@@ -1116,6 +1120,7 @@ def get_pgocc_train_transforms(
     feats_root='/mnt/nvme3/T4_datasets_dinov3clip',
     sam3_root='',
     lidar_depth_root='',
+    flow_root='',
     input_size=(256, 704),
     render_h=180,
     render_w=320,
@@ -1152,6 +1157,9 @@ def get_pgocc_train_transforms(
         transforms.append(LoadFeatMaps(
             data_root=lidar_depth_root, key='gt_depth', apply_aug=False,
             use_chunk_subdirs=True))
+
+    if flow_root:
+        transforms.append(LoadSweepFeatMaps(data_root=flow_root, key='warp_flow'))
 
     transforms.append(PackPGOccInputs(num_cams=num_cams, render_h=render_h, render_w=render_w))
     return Compose(transforms)
