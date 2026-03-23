@@ -128,3 +128,4 @@ e8f449f	ar_mar21_015	-11.6	-11.4	-9.7	-7.7	keep	MEMORY BANK + dyn=2.0: stronger 
 7c3a9ad	ar_mar22_001	-12.5	-12.1	-9.6	-7.4	keep	FLOW-SUPERVISED MOTION HEAD: pre-computed OV flow (1.77M files) + motion_warp + memory bank + all improvements. First test with explicit flow supervision for motion head.
 4267d79	ar_mar22_002	-12.4	-10.8	-8.2	-8.1	keep	DINO INJECTION + memory bank: DINOv3CLIP features fused into FPN level 0 via learnable projection. Gives decoder access to rich ViT semantics. ar_mar21_014 baseline: depth_0=0.4219.
 8279a6f	ar_mar22_003	-12.7	-12.4	-8.2	-7.6	keep	DINO + bank + ov_cos-optimal (df=1.0, dgt=0.3): test DINO injection with ov_cos-optimal config. Previous ov_cos-optimal without DINO: ov_cos=0.0594.
+38c714a	ar_mar22_004	-9.4	-12.1	-7.0	-5.9	keep	MULTI-LEVEL DINO injection (all FPN levels) + bank + ov_cos-optimal. ar_mar22_003 (level 0 only): depth_0=0.4188. Multi-level: ?
