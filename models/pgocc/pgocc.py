@@ -642,6 +642,7 @@ class PGOccLightning(pl.LightningModule):
         else:
             ov_cos_factor = 1.0
 
+        prev_stage_depth = None  # For cross-stage consistency
         for i, gaussian in enumerate(gau_preds):
             # Apply PCA to predicted OV features
             if gaussian.ovs is not None:
@@ -958,6 +959,21 @@ class PGOccLightning(pl.LightningModule):
                 loss_gt = get_gt_loss(render_depth_ed, gt_depth, gt_mask)
                 loss_dict[f'depth_gt_{i}'] = loss_gt.item()
                 total_loss = total_loss + loss_gt * self.loss_weights['depth_gt']
+
+            # === Cross-stage depth consistency ===
+            # Encourage consecutive progressive stages to produce consistent depth.
+            # This regularizes the refinement process and prevents stage drift.
+            if (self.loss_weights.get('stage_consistency', 0) > 0
+                    and prev_stage_depth is not None):
+                # L1 between current and previous stage depth (detach previous to avoid
+                # backward through earlier stage rendering)
+                sc_mask = alpha_mask & (prev_stage_depth > 0.1)
+                if sc_mask.sum() > 100:
+                    sc_loss = (render_depth_ed - prev_stage_depth.detach()).abs()
+                    sc_loss = (sc_loss * sc_mask.float()).sum() / sc_mask.sum().clamp(min=1)
+                    loss_dict[f'stage_consistency_{i}'] = sc_loss.item()
+                    total_loss = total_loss + sc_loss * self.loss_weights['stage_consistency']
+            prev_stage_depth = render_depth_ed.detach()
 
         # === Phase 2: Branch classification loss (projection-based, no extra renders) ===
         # Project Gaussian means to image space, sample SAM3 mask, supervise branch_head.
