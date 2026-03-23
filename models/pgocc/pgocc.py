@@ -212,6 +212,7 @@ class PGOccLightning(pl.LightningModule):
             # Learnable fusion weight (starts at 0 for safe initialization)
             self.dino_fusion_alpha = nn.Parameter(torch.zeros(1))
 
+
         # === Decoder ===
         self.decoder = SparseGaussiansDecoder(
             embed_dims=embed_dims,
