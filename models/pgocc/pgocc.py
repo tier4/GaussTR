@@ -506,15 +506,13 @@ class PGOccLightning(pl.LightningModule):
         # Fusion weight (sigmoid of learnable parameter, starts near 0)
         alpha = torch.sigmoid(self.dino_fusion_alpha)
 
-        # Inject into ALL FPN levels (resize dino_proj to each level's resolution)
-        for lvl in range(len(mlvl_feats)):
-            _, _, _, Hl, Wl = mlvl_feats[lvl].shape
-            dino_resized = F.interpolate(dino_proj, size=(Hl, Wl), mode='bilinear', align_corners=False)
-            fpn_lvl = mlvl_feats[lvl].reshape(B * TN, C, Hl, Wl)
-            dino_full = torch.zeros_like(fpn_lvl)
-            dino_full[:B * N] = dino_resized
-            fpn_lvl = fpn_lvl + alpha * dino_full
-            mlvl_feats[lvl] = fpn_lvl.reshape(B, TN, C, Hl, Wl)
+        # Inject into FPN level 0 only (multi-level was worse — overwhelms lower levels)
+        dino_resized = F.interpolate(dino_proj, size=(H0, W0), mode='bilinear', align_corners=False)
+        fpn0 = mlvl_feats[0].reshape(B * TN, C, H0, W0)
+        dino_full = torch.zeros_like(fpn0)
+        dino_full[:B * N] = dino_resized
+        fpn0 = fpn0 + alpha * dino_full
+        mlvl_feats[0] = fpn0.reshape(B, TN, C, H0, W0)
 
         return mlvl_feats
 
