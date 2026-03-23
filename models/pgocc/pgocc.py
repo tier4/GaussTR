@@ -1079,6 +1079,16 @@ class PGOccLightning(pl.LightningModule):
             loss_dict['flow_supervision'] = loss_flow_sup.item()
             total_loss = total_loss + loss_flow_sup * self.loss_weights['flow_supervision']
 
+        # === Opacity entropy regularization ===
+        # Encourage binary opacity (0 or 1) for crisper scene representation.
+        # Entropy: -p*log(p) - (1-p)*log(1-p) is minimized at p=0 or p=1.
+        if self.loss_weights.get('opacity_entropy', 0) > 0 and gau_preds:
+            finest = gau_preds[-1]
+            op = finest.opacities.clamp(1e-6, 1 - 1e-6)
+            entropy = -(op * op.log() + (1 - op) * (1 - op).log()).mean()
+            loss_dict['opacity_entropy'] = entropy.item()
+            total_loss = total_loss + entropy * self.loss_weights['opacity_entropy']
+
         # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
         # Encourage Gaussians to cover dynamic object regions instead of ignoring them.
         if (sam3_mask is not None
