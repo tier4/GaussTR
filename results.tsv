@@ -136,3 +136,4 @@ cc78374	ar_mar22_008	-6.2	-19.9	-16.5	-3.3	keep	UNFREEZE ALL BACKBONE (frozen_st
 9ac72c8	ar_mar22_009	-6.6	-19.2	-16.4	-3.9	keep	UNFROZEN + depth-boost (df=1.2, dgt=0.4) + DINO + bank + 16K: combine unfreezing with stronger depth supervision to recover depth_0 while keeping good ov_cos.
 065315a	ar_mar22_010	-5.7	-21.3	-16.5	-2.5	keep	UNFROZEN + ov_cos=9.0: push ov_cos lower with unfrozen backbone. Previous best ov_cos=0.0536 with ov_cos=7.0.
 997c50f	ar_mar22_011	-8.4	-20.4	-16.5	-3.9	keep	CROSS-STAGE CONSISTENCY (0.5) + DINO + bank + 16K: regularize progressive refinement. L1 between consecutive stage depth maps. ar_mar22_005 baseline: depth_0=0.4166.
+99384ea	ar_mar22_012	-8.3	-20.2	-16.5	-3.7	keep	UNFROZEN + STAGE CONSISTENCY + DINO + bank + 16K: combine both ov_cos boosters. Best ov_cos was 0.0522 (unfrozen+ov9). Can consistency push it further?
