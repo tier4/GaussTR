@@ -130,3 +130,4 @@ e8f449f	ar_mar21_015	-11.6	-11.4	-9.7	-7.7	keep	MEMORY BANK + dyn=2.0: stronger 
 8279a6f	ar_mar22_003	-12.7	-12.4	-8.2	-7.6	keep	DINO + bank + ov_cos-optimal (df=1.0, dgt=0.3): test DINO injection with ov_cos-optimal config. Previous ov_cos-optimal without DINO: ov_cos=0.0594.
 38c714a	ar_mar22_004	-9.4	-12.1	-7.0	-5.9	keep	MULTI-LEVEL DINO injection (all FPN levels) + bank + ov_cos-optimal. ar_mar22_003 (level 0 only): depth_0=0.4188. Multi-level: ?
 82ab1b9	ar_mar22_005	-9.3	-13.9	-7.0	-6.4	keep	DINO + bank + 16K + ov_cos-optimal: combine DINO injection with 16K Gaussians. Previous 16K best: depth_0=0.4196. With DINO: ?
+9bfbaf1	ar_mar22_006	+0.0	+0.0	-6.5	+0.0	keep	OPACITY ENTROPY (0.1) + DINO + bank + 16K: binary opacity regularization for crisper Gaussians. ar_mar22_005 baseline: depth_0=0.4166.
