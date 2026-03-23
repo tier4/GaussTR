@@ -503,19 +503,18 @@ class PGOccLightning(pl.LightningModule):
         dino = dino_feats.reshape(B * N, *dino_feats.shape[2:])
         dino_proj = self.dino_projector(dino)  # [B*N, C, Hf, Wf]
 
-        # Resize to match FPN level 0
-        dino_proj = F.interpolate(dino_proj, size=(H0, W0), mode='bilinear', align_corners=False)
-
         # Fusion weight (sigmoid of learnable parameter, starts near 0)
         alpha = torch.sigmoid(self.dino_fusion_alpha)
 
-        # Apply to current-frame cameras only (first N of TN channels)
-        fpn0 = mlvl_feats[0].reshape(B * TN, C, H0, W0)
-        # Create a full-size dino tensor (zeros for sweep frames)
-        dino_full = torch.zeros_like(fpn0)
-        dino_full[:B * N] = dino_proj  # Only current-frame cameras get DINO injection
-        fpn0 = fpn0 + alpha * dino_full
-        mlvl_feats[0] = fpn0.reshape(B, TN, C, H0, W0)
+        # Inject into ALL FPN levels (resize dino_proj to each level's resolution)
+        for lvl in range(len(mlvl_feats)):
+            _, _, _, Hl, Wl = mlvl_feats[lvl].shape
+            dino_resized = F.interpolate(dino_proj, size=(Hl, Wl), mode='bilinear', align_corners=False)
+            fpn_lvl = mlvl_feats[lvl].reshape(B * TN, C, Hl, Wl)
+            dino_full = torch.zeros_like(fpn_lvl)
+            dino_full[:B * N] = dino_resized
+            fpn_lvl = fpn_lvl + alpha * dino_full
+            mlvl_feats[lvl] = fpn_lvl.reshape(B, TN, C, Hl, Wl)
 
         return mlvl_feats
 
