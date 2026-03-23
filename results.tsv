@@ -133,3 +133,4 @@ e8f449f	ar_mar21_015	-11.6	-11.4	-9.7	-7.7	keep	MEMORY BANK + dyn=2.0: stronger 
 9bfbaf1	ar_mar22_006	+0.0	+0.0	-6.5	+0.0	keep	OPACITY ENTROPY (0.1) + DINO + bank + 16K: binary opacity regularization for crisper Gaussians. ar_mar22_005 baseline: depth_0=0.4166.
 64180a5	ar_mar22_007	-8.5	-14.9	-7.0	-5.4	keep	SCALE REG (0.1) + DINO + bank + 16K: penalize large Gaussian scales for crisper depth. ar_mar22_005 baseline: depth_0=0.4166.
 cc78374	ar_mar22_008	-6.2	-19.9	-16.5	-3.3	keep	UNFREEZE ALL BACKBONE (frozen_stages=0) + DINO + bank + 16K: let backbone adapt to T4 data. Default frozen_stages=1 freezes ResNet layer1.
+9ac72c8	ar_mar22_009	-6.6	-19.2	-16.4	-3.9	keep	UNFROZEN + depth-boost (df=1.2, dgt=0.4) + DINO + bank + 16K: combine unfreezing with stronger depth supervision to recover depth_0 while keeping good ov_cos.
