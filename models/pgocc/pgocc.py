@@ -1079,15 +1079,16 @@ class PGOccLightning(pl.LightningModule):
             loss_dict['flow_supervision'] = loss_flow_sup.item()
             total_loss = total_loss + loss_flow_sup * self.loss_weights['flow_supervision']
 
-        # === Opacity entropy regularization ===
-        # Encourage binary opacity (0 or 1) for crisper scene representation.
-        # Entropy: -p*log(p) - (1-p)*log(1-p) is minimized at p=0 or p=1.
-        if self.loss_weights.get('opacity_entropy', 0) > 0 and gau_preds:
+        # === Scale regularization ===
+        # Prevent degenerate Gaussians: penalize scales that are too large.
+        # Large Gaussians create blurry depth and cover too many pixels per splat.
+        if self.loss_weights.get('scale_reg', 0) > 0 and gau_preds:
             finest = gau_preds[-1]
-            op = finest.opacities.clamp(1e-6, 1 - 1e-6)
-            entropy = -(op * op.log() + (1 - op) * (1 - op).log()).mean()
-            loss_dict['opacity_entropy'] = entropy.item()
-            total_loss = total_loss + entropy * self.loss_weights['opacity_entropy']
+            # Max scale per Gaussian: penalize if > 2.0 (voxel size ~0.4m, so 2.0 = 5 voxels)
+            max_scales = finest.scales.max(dim=-1).values  # [B, Q]
+            scale_penalty = F.relu(max_scales - 1.5).mean()  # Only penalize scales > 1.5
+            loss_dict['scale_reg'] = scale_penalty.item()
+            total_loss = total_loss + scale_penalty * self.loss_weights['scale_reg']
 
         # === Dynamic coverage losses (Phase 1: SelfOccFlow-inspired) ===
         # Encourage Gaussians to cover dynamic object regions instead of ignoring them.
