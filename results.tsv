@@ -142,3 +142,4 @@ edeeb67	ar_mar22_014	-6.0	-20.5	-16.5	-3.3	keep	POSITION-CONDITIONED OV + DINO +
 8f34ea0	ar_mar22_015	-6.6	-21.0	-16.5	-3.4	keep	POS-OV + UNFROZEN + DINO + bank + 16K: combine two ov_cos boosters (position conditioning + unfrozen backbone). Best individual ov_cos: 0.0522 (unfrozen+ov9), 0.0536 (unfrozen), 0.0538 (pos-OV).
 f9586ae	ar_mar22_016	-5.4	-21.8	-16.5	-3.1	keep	POS-OV + UNFROZEN + ov_cos=9.0: maximum ov_cos push. Best ov_cos so far: 0.0522 (unfrozen+ov9 without pos-OV). With pos-OV: ?
 fef64f9	ar_mar22_017	-6.8	-19.8	-16.4	-4.5	keep	POS-OV + DINO + bank + 16K + depth-boost (df=1.2, dgt=0.4): combine position-conditioned OV with depth-focused config. Best depth_0 was 0.4166.
+aa8507e	ar_mar22_018	-6.3	-20.1	-16.5	-3.2	keep	GAUSSIAN SELF-ATTENTION + DINO + bank + 16K: TransformerEncoder at finest layer lets Gaussians communicate. Gated (safe init). ar_mar22_005 baseline: depth_0=0.4166.
