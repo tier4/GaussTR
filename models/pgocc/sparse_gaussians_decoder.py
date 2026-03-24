@@ -117,6 +117,17 @@ class SparseGaussiansDecoder(nn.Module):
                     ),
                 ]))
 
+        # Position encoder for OV features (spatial awareness)
+        # Separate from the main position_encoder to avoid interfering with geometry
+        self.position_encoder_ov = nn.Sequential(
+            nn.Linear(3, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+        )
+        # Zero-init so it starts as identity (no position influence initially)
+        nn.init.zeros_(self.position_encoder_ov[-1].weight)
+        nn.init.zeros_(self.position_encoder_ov[-1].bias)
+
         # Phase 2: static/dynamic branch head (SelfOccFlow-inspired)
         # Predicts per-Gaussian routing: p_static + p_dynamic = 1
         self.branch_heads = nn.ModuleList([
@@ -373,9 +384,11 @@ class SparseGaussiansDecoder(nn.Module):
             merged_rots = torch.cat(all_rots, dim=1)
             merged_opacities = torch.cat(all_opacities, dim=1)
 
-            # OV feature prediction
+            # OV feature prediction (with position conditioning)
             if self.render_conf.get('use_ov', True) and len(self.ov_heads) > i:
-                ov_query_feat = query_feat_part
+                # Condition OV features on 3D position for spatial awareness
+                pos_encoding = self.position_encoder_ov(query_coord[..., :3]) if hasattr(self, 'position_encoder_ov') else 0
+                ov_query_feat = query_feat_part + pos_encoding
                 for ov_layer in self.ov_heads[i]:
                     ov_query_feat = ov_layer(ov_query_feat)
             else:
