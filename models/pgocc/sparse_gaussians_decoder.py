@@ -143,6 +143,16 @@ class SparseGaussiansDecoder(nn.Module):
             for p in self.branch_heads.parameters():
                 p.requires_grad = False
 
+        # Gaussian self-attention refinement (finest layer only)
+        # Lets nearby Gaussians communicate to avoid redundancy and improve coherence.
+        # Lightweight: single attention layer with 4 heads.
+        self.gaussian_self_attn = nn.TransformerEncoderLayer(
+            d_model=embed_dims, nhead=4, dim_feedforward=embed_dims * 2,
+            dropout=0.1, batch_first=True,
+        )
+        # Gate: starts at 0 for safe init (no refinement initially)
+        self.gaussian_attn_gate = nn.Parameter(torch.zeros(1))
+
         # Phase 4: motion head — predicts per-query XY offsets to past frames
         # Only on finest layer. Output: [B, Q, 2*num_motion_frames]
         # Zero-init output layer so motion starts at zero (no motion = static)
@@ -383,6 +393,12 @@ class SparseGaussiansDecoder(nn.Module):
             merged_scales = torch.cat(all_scales, dim=1)
             merged_rots = torch.cat(all_rots, dim=1)
             merged_opacities = torch.cat(all_opacities, dim=1)
+
+            # Gaussian self-attention refinement (finest layer only)
+            if i == len(self.layers_scales) - 1:
+                gate = torch.sigmoid(self.gaussian_attn_gate)
+                refined = self.gaussian_self_attn(query_feat_part)
+                query_feat_part = query_feat_part + gate * (refined - query_feat_part)
 
             # OV feature prediction (with position conditioning)
             if self.render_conf.get('use_ov', True) and len(self.ov_heads) > i:
