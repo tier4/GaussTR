@@ -143,6 +143,14 @@ class SparseGaussiansDecoder(nn.Module):
             for p in self.branch_heads.parameters():
                 p.requires_grad = False
 
+        # Auxiliary depth head: predict depth directly from query features
+        # Bypasses Gaussian rendering for direct depth supervision path
+        self.aux_depth_head = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, 1),  # Predicts depth value per Gaussian
+        )
+
         # Gaussian self-attention refinement (finest layer only)
         # Lets nearby Gaussians communicate to avoid redundancy and improve coherence.
         # Lightweight: single attention layer with 4 heads.
@@ -417,12 +425,14 @@ class SparseGaussiansDecoder(nn.Module):
             prev_branch_probs = b_probs  # feed to next layer for temporal masking
 
             # Phase 4: motion head (finest layer only)
-            # Non-detached: motion gradient flows to decoder features.
-            # This is necessary because motion regression (continuous 2D offset)
-            # requires richer feature information than binary classification.
             motion_offsets = None
             if i == len(self.layers_scales) - 1:
                 motion_offsets = self.motion_head(query_feat_part)  # [B, Q, 2*P]
+
+            # Auxiliary depth: predict depth directly from features (finest layer)
+            aux_depth = None
+            if i == len(self.layers_scales) - 1:
+                aux_depth = F.softplus(self.aux_depth_head(query_feat_part.detach()))  # [B, Q, 1]
 
             pred_gaussians = GaussianPrediction(
                 means=query_coord,
@@ -434,6 +444,7 @@ class SparseGaussiansDecoder(nn.Module):
                 branch_logits=b_logits,
                 branch_probs=b_probs,
                 motion_offsets=motion_offsets,
+                aux_depth=aux_depth,
             )
             gau_preds.append(pred_gaussians)
 

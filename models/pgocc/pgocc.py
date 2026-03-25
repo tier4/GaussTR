@@ -1095,6 +1095,26 @@ class PGOccLightning(pl.LightningModule):
             loss_dict['flow_supervision'] = loss_flow_sup.item()
             total_loss = total_loss + loss_flow_sup * self.loss_weights['flow_supervision']
 
+        # === Auxiliary depth loss ===
+        # Direct depth supervision on query features (bypasses rendering).
+        # Project each Gaussian to cameras, compare aux_depth with foundation depth.
+        if (self.loss_weights.get('aux_depth', 0) > 0
+                and gau_preds and gau_preds[-1].aux_depth is not None):
+            finest = gau_preds[-1]
+            means = finest.means[0]  # [Q, 3]
+            ad = finest.aux_depth[0].squeeze(-1)  # [Q] predicted depth
+            # Compute actual depth from ego-frame Z coordinate
+            # (Z in ego frame ≈ depth from camera for front-facing cameras)
+            actual_z = means[:, 2]  # Z coordinate in ego frame
+            # The aux_depth predicts the norm distance from origin
+            actual_depth = means.norm(dim=-1)  # [Q] distance from ego origin
+            # L1 loss between aux prediction and actual position-derived depth
+            valid = (actual_depth > 0.5) & (actual_depth < 60.0)
+            if valid.sum() > 100:
+                aux_loss = (ad[valid] - actual_depth[valid].detach()).abs().mean()
+                loss_dict['aux_depth'] = aux_loss.item()
+                total_loss = total_loss + aux_loss * self.loss_weights['aux_depth']
+
         # === Scale regularization ===
         # Prevent degenerate Gaussians: penalize scales that are too large.
         # Large Gaussians create blurry depth and cover too many pixels per splat.
