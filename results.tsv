@@ -149,3 +149,4 @@ d0b35d5	ar_mar22_021	-8.4	-15.0	-10.4	-6.8	keep	HIGHER RENDER RESOLUTION 224x400
 c4d06b4	ar_mar22_022	-9.1	-13.8	-10.3	-7.0	keep	HIGH-RES 224x400 + depth-boost + DINO + bank + 16K: maximize depth_gt quality. Previous high-res: depth_gt=1.7177. With depth-boost: ?
 6b95c1a	ar_mar22_023	-7.7	-15.4	-9.1	-5.9	keep	HIGH-RES 224x400 + UNFROZEN + DINO + bank + 16K: combine high resolution with unfrozen backbone for maximum ov_cos at higher res.
 b8bac2f	ar_mar22_024	-3.6	-18.8	-5.9	-3.0	keep	aux_depth=0.5+DINO+bank+16K: auxiliary depth head doesn't help (depth_0=0.4275 vs baseline 0.4166). Trivial self-supervision.
+5e801fb	ar_mar25_001	-3.5	-19.1	-5.9	-3.4	keep	Baseline with W&B logging: DINO+bank+16K. depth_0=0.4285 ov_cos=0.0538. W&B migration doesn't affect model quality.
