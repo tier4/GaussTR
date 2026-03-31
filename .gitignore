@@ -61,6 +61,10 @@ dmypy.json
 *.db
 mlflow.db
 
+# W&B
+wandb/
+.wandb_config.yaml
+
 # Work directories (training outputs, checkpoints, logs)
 work_dirs/
 
@@ -70,7 +74,7 @@ ckpts/
 # Data directories
 data
 
-# MLflow (mlruns/ is legacy - we use sqlite:// backend)
+# MLflow (legacy - migrated to W&B)
 mlruns/
 mlflow_artifacts/
 

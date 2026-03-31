@@ -146,11 +146,14 @@ python -m scripts.test checkpoint=ckpts/gausstr_featup.pth
 
 ### Experiment Tracking
 
-This implementation uses MLflow for experiment tracking by default:
+This implementation uses [Weights & Biases](https://wandb.ai) for experiment tracking.
 
 ```bash
-# Launch MLflow UI (from project root)
-mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db
+# Login to W&B (one-time setup)
+wandb login
+
+# Configure entity/project in .wandb_config.yaml (local, not committed)
+# Metrics, system stats, and artifacts are logged automatically during training
 ```
 
 ## Citation

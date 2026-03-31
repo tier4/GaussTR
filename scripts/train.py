@@ -87,13 +87,23 @@ print(f"[RANK {_local_rank}] CUDA_HOME={os.environ.get('CUDA_HOME', 'NOT SET')},
 del _glob, _setup_cuda, _local_rank
 # === End CUDA Setup ===
 
-# Set MLflow tracking URI and artifact root via environment variables BEFORE any imports
-# This ensures all DDP worker processes use the database instead of creating mlruns/
-# Use direct assignment (not setdefault) to override any existing value
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ['MLFLOW_TRACKING_URI'] = f'sqlite:///{_project_root}/mlruns/mlflow.db'
-os.environ['MLFLOW_ARTIFACT_ROOT'] = f'{_project_root}/mlruns/mlflow_artifacts'
-del _project_root
+# === W&B Setup ===
+# Load API key from secure file if not already set
+if not os.environ.get('WANDB_API_KEY'):
+    _key_path = os.path.expanduser('~/.wandb_api_key')
+    if os.path.exists(_key_path):
+        with open(_key_path) as _f:
+            os.environ['WANDB_API_KEY'] = _f.read().strip()
+
+def _load_wandb_config():
+    """Load local W&B config (entity, project mappings) from .wandb_config.yaml."""
+    import yaml
+    _cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.wandb_config.yaml')
+    if os.path.exists(_cfg_path):
+        with open(_cfg_path) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+# === End W&B Setup ===
 
 import sys
 import warnings
@@ -110,14 +120,8 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     RichProgressBar,
 )
-from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger, MLFlowLogger
-import mlflow
-
-# Explicitly set tracking URI right after import to prevent mlruns/ folder creation
-mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
-
-# Suppress MLflow filesystem deprecation warning
-warnings.filterwarnings("ignore", message=".*filesystem tracking backend.*will be deprecated.*")
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+import wandb
 # Suppress grid_sample align_corners warning
 warnings.filterwarnings("ignore", message=".*Default grid_sample and affine_grid behavior.*")
 # Suppress lr_scheduler.step() warning - this is expected in Lightning with step-based scheduling
@@ -139,64 +143,63 @@ from dataset import GaussTRDataModule
 from evaluation import OccupancyIoU
 
 
-class MLflowArtifactCallback(Callback):
-    """Callback to log artifacts to MLflow after the run is started.
-
-    Uses MlflowClient with explicit tracking URI to avoid creating mlruns/ folder.
-    """
+class WandbCallback(Callback):
+    """Callback for W&B: config artifact, model watching, checkpoint artifacts, alerts."""
 
     def __init__(self, config: DictConfig, checkpoint_dir: str):
         self.config = config
         self.checkpoint_dir = checkpoint_dir
         self._logged = False
-        self._client = None
-
-    def _get_client(self, trainer):
-        """Get MlflowClient using the logger's tracking URI."""
-        if self._client is None:
-            tracking_uri = os.environ.get('MLFLOW_TRACKING_URI')
-            self._client = mlflow.MlflowClient(tracking_uri=tracking_uri)
-        return self._client
 
     def on_train_start(self, trainer, pl_module):
-        """Log artifacts once MLflow run is active."""
+        """Log config artifact and watch model gradients."""
         if self._logged:
             return
         self._logged = True
 
-        # Get the MLflow run_id from the logger
-        if hasattr(trainer.logger, 'run_id') and trainer.logger.run_id:
-            run_id = trainer.logger.run_id
-            client = self._get_client(trainer)
-
-            # Save and log config
-            config_path = os.path.join(self.checkpoint_dir, 'config.yaml')
-            with open(config_path, 'w') as f:
-                f.write(OmegaConf.to_yaml(self.config))
-            client.log_artifact(run_id, config_path)
-            print(f"Logged config artifact to MLflow run {run_id}")
-
-    def on_train_end(self, trainer, pl_module):
-        """Log final checkpoints and outputs to MLflow."""
-        if not hasattr(trainer.logger, 'run_id') or not trainer.logger.run_id:
+        if wandb.run is None:
             return
 
-        run_id = trainer.logger.run_id
-        client = self._get_client(trainer)
+        # Save and log config as versioned artifact
+        config_path = os.path.join(self.checkpoint_dir, 'config.yaml')
+        with open(config_path, 'w') as f:
+            f.write(OmegaConf.to_yaml(self.config))
+        artifact = wandb.Artifact(f'config-{wandb.run.id}', type='config')
+        artifact.add_file(config_path)
+        wandb.log_artifact(artifact)
 
-        # Log best checkpoint
+        # Watch model — logs gradients and parameter histograms
+        wandb.watch(pl_module, log='all', log_freq=100, log_graph=True)
+
+    def on_train_end(self, trainer, pl_module):
+        """Log checkpoint artifacts and send completion alert."""
+        if wandb.run is None:
+            return
+
+        # Log checkpoints as versioned artifact
+        ckpt_artifact = wandb.Artifact(
+            f'checkpoints-{wandb.run.id}', type='model',
+            metadata={'run_name': wandb.run.name},
+        )
+        has_files = False
         if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
             best_ckpt = trainer.checkpoint_callback.best_model_path
             if os.path.exists(best_ckpt):
-                client.log_artifact(run_id, best_ckpt, artifact_path="checkpoints")
-                print(f"Logged best checkpoint to MLflow: {best_ckpt}")
-
-        # Log last checkpoint
+                ckpt_artifact.add_file(best_ckpt, name=os.path.basename(best_ckpt))
+                has_files = True
         if trainer.checkpoint_callback and trainer.checkpoint_callback.last_model_path:
             last_ckpt = trainer.checkpoint_callback.last_model_path
-            if os.path.exists(last_ckpt) and last_ckpt != trainer.checkpoint_callback.best_model_path:
-                client.log_artifact(run_id, last_ckpt, artifact_path="checkpoints")
-                print(f"Logged last checkpoint to MLflow: {last_ckpt}")
+            if os.path.exists(last_ckpt) and last_ckpt != getattr(trainer.checkpoint_callback, 'best_model_path', None):
+                ckpt_artifact.add_file(last_ckpt, name=os.path.basename(last_ckpt))
+                has_files = True
+        if has_files:
+            wandb.log_artifact(ckpt_artifact)
+
+        wandb.alert(
+            title=f"Training Complete: {wandb.run.name}",
+            text=f"Run {wandb.run.name} finished. Check results at {wandb.run.url}",
+            level=wandb.AlertLevel.INFO,
+        )
 
 
 def build_callbacks(cfg: DictConfig, checkpoint_dir: str, log_artifacts: bool = False) -> list:
@@ -205,7 +208,7 @@ def build_callbacks(cfg: DictConfig, checkpoint_dir: str, log_artifacts: bool = 
     Args:
         cfg: Hydra configuration.
         checkpoint_dir: Directory to save checkpoints (includes run_name).
-        log_artifacts: Whether to add MLflow artifact logging callback.
+        log_artifacts: Whether to add W&B artifact logging callback.
 
     Returns:
         List of Lightning callbacks.
@@ -251,9 +254,9 @@ def build_callbacks(cfg: DictConfig, checkpoint_dir: str, log_artifacts: bool = 
         )
         callbacks.append(early_stop)
 
-    # MLflow artifact logging
+    # W&B callback (config save, model watching, alerts)
     if log_artifacts:
-        callbacks.append(MLflowArtifactCallback(cfg, checkpoint_dir))
+        callbacks.append(WandbCallback(cfg, checkpoint_dir))
 
     # Visualization callback (optional) - runs after test
     vis_cfg = cfg.get('visualization', {})
@@ -283,39 +286,34 @@ def build_logger(cfg: DictConfig, run_name: str, output_dir: str):
     Returns:
         Lightning logger instance.
     """
-    logger_type = cfg.get('logger', 'mlflow')
+    logger_type = cfg.get('logger', 'wandb')
 
     if logger_type == 'wandb':
+        # Flatten Hydra config for W&B config tracking (enables config diffing in UI)
+        flat_config = OmegaConf.to_container(cfg, resolve=True)
+
+        # Load entity/project from local .wandb_config.yaml (not committed)
+        wandb_cfg = _load_wandb_config()
+        experiment_name = cfg.get('experiment_name', 'gausstr_lightning')
+        project = wandb_cfg.get('default_projects', {}).get(experiment_name, experiment_name)
+        entity = wandb_cfg.get('entity')
+
         return WandbLogger(
-            project=cfg.get('wandb_project', 'gausstr'),
-            name=cfg.get('experiment_name', 'gausstr_lightning'),
+            project=project,
+            entity=entity,
+            name=run_name,
+            group=experiment_name,
             save_dir=output_dir,
+            log_model=False,  # We handle artifacts via WandbArtifactCallback
+            config=flat_config,
         )
-    elif logger_type == 'mlflow':
-        # Use SQLite database for tracking
-        tracking_uri = cfg.get('mlflow_tracking_uri', 'sqlite:///mlflow.db')
-        artifact_location = cfg.get('mlflow_artifact_location', 'work_dirs/mlflow_artifacts')
-
-        # Ensure artifact directory exists
-        os.makedirs(artifact_location, exist_ok=True)
-
-        # Convert to file:// URI if it's a local path
-        if not artifact_location.startswith(('file://', 's3://', 'gs://', 'hdfs://')):
-            artifact_location = f"file://{os.path.abspath(artifact_location)}"
-
-        return MLFlowLogger(
-            experiment_name=cfg.get('experiment_name', 'gausstr_lightning'),
-            tracking_uri=tracking_uri,
-            run_name=run_name,
-            tags=cfg.get('mlflow_tags', None),
-            artifact_location=artifact_location,
-            save_dir=None,  # Prevent creating ./mlruns folder
-        )
-    else:  # tensorboard
+    elif logger_type == 'tensorboard':
         return TensorBoardLogger(
             save_dir=output_dir,
             name='logs',
         )
+    else:
+        raise ValueError(f"Unknown logger type: {logger_type}. Use 'wandb' or 'tensorboard'.")
 
 
 @hydra.main(
@@ -351,7 +349,7 @@ def main(cfg: DictConfig) -> None:
     run_name = cfg.get('run_name')
     if not run_name:
         run_name = os.path.basename(hydra_output_dir)
-        # Update cfg so MLflow logger uses the same run_name
+        # Update cfg so W&B logger uses the same run_name
         if OmegaConf.is_readonly(cfg):
             OmegaConf.set_readonly(cfg, False)
         cfg.run_name = run_name
@@ -386,19 +384,18 @@ def main(cfg: DictConfig) -> None:
     data_cfg = OmegaConf.to_container(cfg.data, resolve=True)
     datamodule = GaussTRDataModule(**data_cfg)
 
-    # Determine if using MLflow
-    use_mlflow = cfg.get('logger', 'mlflow') == 'mlflow'
+    # Determine if using W&B
+    use_wandb = cfg.get('logger', 'wandb') == 'wandb'
 
     # Build callbacks (checkpoints saved under checkpoint_dir = work_dir/run_name)
-    # Add artifact logging callback only for MLflow on main process
-    callbacks = build_callbacks(cfg, checkpoint_dir, log_artifacts=(use_mlflow and is_main))
+    # Add artifact logging callback only for W&B on main process
+    callbacks = build_callbacks(cfg, checkpoint_dir, log_artifacts=(use_wandb and is_main))
 
     # Build logger
     logger = build_logger(cfg, run_name, checkpoint_dir)
 
-    # Note: MLflow autolog is intentionally NOT used here.
-    # autolog() creates mlruns/ folder even with tracking_uri set, and logs duplicate metrics.
-    # Instead, we use MLflowArtifactCallback for artifact logging and Lightning's MLFlowLogger for metrics.
+    # W&B system metrics (GPU, CPU, memory, disk) are logged automatically.
+    # Model gradients/params are watched via WandbArtifactCallback.on_train_start().
 
     # Build trainer
     trainer_cfg = OmegaConf.to_container(cfg.get('trainer', {}), resolve=True)

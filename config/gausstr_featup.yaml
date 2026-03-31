@@ -16,11 +16,9 @@ hydra:
 # Experiment settings
 seed: 42
 work_dir: work_dirs/${experiment_name}  # Base work directory
-logger: "mlflow"  # Options: "mlflow", "tensorboard", "wandb"
+logger: "wandb"  # Options: "wandb", "tensorboard"
 experiment_name: "gausstr_featup"
-run_name: null  # Optional: specific run name for MLflow (auto-generated if null)
-mlflow_tracking_uri: "sqlite:///mlruns/mlflow.db"  # SQLite database
-mlflow_artifact_location: "mlruns/artifacts"  # Artifact storage
+run_name: null  # Optional: specific run name (auto-generated if null)
 use_rich_progress: true
 early_stopping: false
 test_after_training: true

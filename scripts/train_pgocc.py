@@ -53,11 +53,22 @@ def _setup_cuda():
 _setup_cuda()
 del _glob, _setup_cuda
 
-# === MLflow Setup ===
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.environ['MLFLOW_TRACKING_URI'] = f'sqlite:///{_project_root}/mlruns/mlflow.db'
-os.environ['MLFLOW_ARTIFACT_ROOT'] = f'{_project_root}/mlruns/mlflow_artifacts'
-del _project_root
+# === W&B Setup ===
+if not os.environ.get('WANDB_API_KEY'):
+    _key_path = os.path.expanduser('~/.wandb_api_key')
+    if os.path.exists(_key_path):
+        with open(_key_path) as _f:
+            os.environ['WANDB_API_KEY'] = _f.read().strip()
+
+def _load_wandb_config():
+    """Load local W&B config (entity, project mappings) from .wandb_config.yaml."""
+    import yaml
+    _cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.wandb_config.yaml')
+    if os.path.exists(_cfg_path):
+        with open(_cfg_path) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+# === End W&B Setup ===
 
 import sys
 import warnings
@@ -72,12 +83,8 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     RichProgressBar,
 )
-from pytorch_lightning.loggers import MLFlowLogger
-import mlflow
-
-mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
-
-warnings.filterwarnings("ignore", message=".*filesystem tracking backend.*will be deprecated.*")
+from pytorch_lightning.loggers import WandbLogger
+import wandb
 warnings.filterwarnings("ignore", message=".*Default grid_sample and affine_grid behavior.*")
 warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*optimizer.step.*")
 warnings.filterwarnings("ignore", message=".*Grad strides do not match bucket view strides.*")
@@ -164,17 +171,26 @@ def main(cfg: DictConfig) -> None:
     if cfg.get('use_rich_progress', True):
         callbacks.append(RichProgressBar())
 
-    # Logger — use the absolute tracking URI from env (Hydra changes CWD, so relative paths break)
-    logger = MLFlowLogger(
-        experiment_name=cfg.get('experiment_name', 'pgocc_t4'),
-        tracking_uri=os.environ['MLFLOW_TRACKING_URI'],
-        run_name=run_name,
-        artifact_location=os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'mlruns', 'mlflow_artifacts',
-        ),
-        save_dir=None,
+    # Logger — W&B with full config tracking and system metrics
+    flat_config = OmegaConf.to_container(cfg, resolve=True)
+    wandb_cfg = _load_wandb_config()
+    experiment_name = cfg.get('experiment_name', 'pgocc_t4')
+    wb_project = wandb_cfg.get('default_projects', {}).get(experiment_name, experiment_name)
+    wb_entity = wandb_cfg.get('entity')
+
+    logger = WandbLogger(
+        project=wb_project,
+        entity=wb_entity,
+        name=run_name,
+        group=experiment_name,
+        save_dir=checkpoint_dir,
+        log_model=False,
+        config=flat_config,
     )
+
+    # Watch model — auto-log gradients and parameter histograms
+    if is_main and wandb.run is not None:
+        wandb.watch(model, log='all', log_freq=100)
 
     # Save config
     if is_main:
@@ -212,6 +228,37 @@ def main(cfg: DictConfig) -> None:
     # Train
     ckpt_path = cfg.get('resume_from', None)
     trainer.fit(model, datamodule, ckpt_path=ckpt_path)
+
+    # Log artifacts, alert, and finish W&B run
+    if is_main and wandb.run is not None:
+        # Config artifact
+        config_path = os.path.join(checkpoint_dir, 'config.yaml')
+        if os.path.exists(config_path):
+            config_artifact = wandb.Artifact(f'config-{wandb.run.id}', type='config')
+            config_artifact.add_file(config_path)
+            wandb.log_artifact(config_artifact)
+
+        # Checkpoint artifact
+        if trainer.checkpoint_callback:
+            ckpt_artifact = wandb.Artifact(f'checkpoints-{wandb.run.id}', type='model')
+            has_files = False
+            best = trainer.checkpoint_callback.best_model_path
+            if best and os.path.exists(best):
+                ckpt_artifact.add_file(best, name=os.path.basename(best))
+                has_files = True
+            last = trainer.checkpoint_callback.last_model_path
+            if last and os.path.exists(last) and last != best:
+                ckpt_artifact.add_file(last, name=os.path.basename(last))
+                has_files = True
+            if has_files:
+                wandb.log_artifact(ckpt_artifact)
+
+        wandb.alert(
+            title=f"Training Complete: {run_name}",
+            text=f"PG-Occ run {run_name} finished ({trainer.global_step} steps). Results: {wandb.run.url}",
+            level=wandb.AlertLevel.INFO,
+        )
+        wandb.finish()
 
     print(f"Training complete. Checkpoints saved to: {checkpoint_dir}")
 

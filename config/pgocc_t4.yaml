@@ -14,11 +14,9 @@ hydra:
 
 seed: 42
 work_dir: work_dirs/${experiment_name}
-logger: "mlflow"
+logger: "wandb"
 experiment_name: "pgocc_t4"
 run_name: null
-mlflow_tracking_uri: "sqlite:///mlruns/mlflow.db"
-mlflow_artifact_location: "mlruns/artifacts"
 use_rich_progress: true
 early_stopping: false
 test_after_training: false

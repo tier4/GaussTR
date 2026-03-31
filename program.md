@@ -36,7 +36,7 @@ python -m scripts.eval_experiment --next-name
 python -m scripts.eval_experiment --list ar_mar12
 ```
 
-The naming is automatic — you never hardcode names. The eval script tracks used numbers via both MLflow and results.tsv.
+The naming is automatic — you never hardcode names. The eval script tracks used numbers via both W&B and results.tsv.
 
 ## Experimentation
 
@@ -50,11 +50,14 @@ timeout 4500 python -m scripts.train_pgocc \
   +load_from=/tmp/fixv23_best.ckpt \
   trainer.devices=4 \
   +trainer.max_steps=3000 \
-  trainer.max_epochs=999 \
+  trainer.max_epochs=1 \
   data.num_workers=4 \
   <additional overrides> \
   > /tmp/<experiment_name>.log 2>&1
 ```
+
+NOTE: Use `trainer.max_epochs=1` NOT `max_epochs=999`. With max_epochs=1, `estimated_stepping_batches=max_steps`, and `steps_per_epoch=max_steps//1=max_steps`, which correctly activates warmup fractions. With max_epochs=999, steps_per_epoch≈1 and all warmup fractions are disabled.
+
 
 ### What You CAN Modify
 
@@ -113,7 +116,7 @@ If the eval script isn't available or you need manual analysis, follow this prot
 
 ## Output Format
 
-The training script logs to MLflow. After completion, extract key metrics:
+The training script logs to W&B. After completion, extract key metrics:
 
 ```bash
 python -m scripts.eval_experiment --run-name <experiment_name> --json
